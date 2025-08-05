@@ -688,7 +688,6 @@ func NewBaseService[T GlobalModels.ORMModel](ctx context.Context, db *mongo.Data
 		}
 		return StringLibs.Pluralize(StringLibs.ConvertToSnakeCase(t.Name()))
 	}
-
 	baseService := &BaseService[T]{
 		Ctx:        ctx,
 		DB:         db,
