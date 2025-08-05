@@ -1,3 +1,7 @@
 .idea
 *debug*
 *.log
+*.out
+*.exe
+
+/logs
