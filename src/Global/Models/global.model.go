@@ -33,6 +33,8 @@ type ORMModel interface {
 	GetCreatedAtColumn() string
 	GetUpdatedAtColumn() string
 	GetDeletedAtColumn() string
+
+	GetCollection() string
 }
 
 // GetID returns the ObjectID of the model.
@@ -116,4 +118,8 @@ func (b *BaseModel) GetUpdatedAtColumn() string {
 
 func (b *BaseModel) GetDeletedAtColumn() string {
 	return "deleted_at"
+}
+
+func (b *BaseModel) GetCollection() string {
+	return b.GetTable()
 }
