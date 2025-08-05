@@ -15,9 +15,9 @@ import (
 	"time"
 )
 
-// QueryBuilder is a struct for query building
+// MongoQueryBuilder is a struct for query building
 // It is a chainable struct
-type QueryBuilder[T GlobalModels.ORMModel] struct {
+type MongoQueryBuilder[T GlobalModels.ORMModel] struct {
 	service    *BaseService[T]
 	filter     bson.M
 	opts       *options.FindOptions
@@ -28,24 +28,24 @@ type QueryBuilder[T GlobalModels.ORMModel] struct {
 }
 
 // CollectionName returns the name of the MongoDB collection associated with
-// the QueryBuilder.
+// the MongoQueryBuilder.
 //
 // Returns:
 //
-//	string: The name of the MongoDB collection used by the QueryBuilder.
-func (qb *QueryBuilder[T]) CollectionName() string {
+//	string: The name of the MongoDB collection used by the MongoQueryBuilder.
+func (qb *MongoQueryBuilder[T]) CollectionName() string {
 	return qb.service.GetCollectionName()
 }
 
-// GetCollection returns the MongoDB collection associated with the QueryBuilder.
+// GetCollection returns the MongoDB collection associated with the MongoQueryBuilder.
 //
 // This method retrieves the collection from the underlying service, allowing
 // direct access to the MongoDB collection for advanced operations.
 //
 // Returns:
 //
-//	*mongo.Collection: The MongoDB collection used by the QueryBuilder.
-func (qb *QueryBuilder[T]) GetCollection() *mongo.Collection {
+//	*mongo.Collection: The MongoDB collection used by the MongoQueryBuilder.
+func (qb *MongoQueryBuilder[T]) GetCollection() *mongo.Collection {
 	return qb.service.GetCollection()
 }
 
@@ -54,7 +54,7 @@ func (qb *QueryBuilder[T]) GetCollection() *mongo.Collection {
 // Example:
 //
 //	qb := db.Users().Where(bson.M{"age": bson.M{"$gt": 18}})
-//	qb = qb.Apply(func(qb *QueryBuilder[User]) *QueryBuilder[User] {
+//	qb = qb.Apply(func(qb *MongoQueryBuilder[User]) *MongoQueryBuilder[User] {
 //	    qb = qb.WithTrashed()
 //	    return qb
 //	})
@@ -62,7 +62,7 @@ func (qb *QueryBuilder[T]) GetCollection() *mongo.Collection {
 // This is equivalent to:
 //
 //	qb := db.Users().Where(bson.M{"age": bson.M{"$gt": 18}}).WithTrashed()
-func (qb *QueryBuilder[T]) Apply(scope func(*QueryBuilder[T]) *QueryBuilder[T]) *QueryBuilder[T] {
+func (qb *MongoQueryBuilder[T]) Apply(scope func(*MongoQueryBuilder[T]) *MongoQueryBuilder[T]) *MongoQueryBuilder[T] {
 	return scope(qb)
 }
 
@@ -79,7 +79,7 @@ func (qb *QueryBuilder[T]) Apply(scope func(*QueryBuilder[T]) *QueryBuilder[T]) 
 //	    "age": bson.M{"$gt": 18},
 //	    "deleted_at": nil,
 //	})
-func (qb *QueryBuilder[T]) Where(condition bson.M) *QueryBuilder[T] {
+func (qb *MongoQueryBuilder[T]) Where(condition bson.M) *MongoQueryBuilder[T] {
 	for k, v := range condition {
 		qb.filter[k] = v
 	}
@@ -101,7 +101,7 @@ func (qb *QueryBuilder[T]) Where(condition bson.M) *QueryBuilder[T] {
 //	qb := db.Users()
 //	qb.IgnoreDeletedAtFilter()
 //	users, _ := qb.Get()
-func (qb *QueryBuilder[T]) WithTrashed() *QueryBuilder[T] {
+func (qb *MongoQueryBuilder[T]) WithTrashed() *MongoQueryBuilder[T] {
 	delete(qb.filter, "deleted_at")
 	return qb
 }
@@ -120,7 +120,7 @@ func (qb *QueryBuilder[T]) WithTrashed() *QueryBuilder[T] {
 //	qb := db.Users()
 //	qb.filter["deleted_at"] = bson.M{"$ne": time.Time{}}
 //	users, _ := qb.Get()
-func (qb *QueryBuilder[T]) OnlyTrashed() *QueryBuilder[T] {
+func (qb *MongoQueryBuilder[T]) OnlyTrashed() *MongoQueryBuilder[T] {
 	qb.filter["deleted_at"] = bson.M{"$ne": time.Time{}}
 	return qb
 }
@@ -139,7 +139,7 @@ func (qb *QueryBuilder[T]) OnlyTrashed() *QueryBuilder[T] {
 //	qb := db.Users()
 //	qb.filter["deleted_at"] = time.Time{}
 //	users, _ := qb.Get()
-func (qb *QueryBuilder[T]) Active() *QueryBuilder[T] {
+func (qb *MongoQueryBuilder[T]) Active() *MongoQueryBuilder[T] {
 	qb.filter["deleted_at"] = time.Time{}
 	return qb
 }
@@ -149,7 +149,7 @@ func (qb *QueryBuilder[T]) Active() *QueryBuilder[T] {
 // The field parameter specifies the field to sort by. The ascending parameter
 // specifies whether the sort order is ascending or descending.
 //
-// The method returns the modified QueryBuilder.
+// The method returns the modified MongoQueryBuilder.
 //
 // Example:
 //
@@ -161,7 +161,7 @@ func (qb *QueryBuilder[T]) Active() *QueryBuilder[T] {
 //	qb := db.Users()
 //	qb.order = append(qb.order, bson.E{Key: "age", Value: 1})
 //	users, _ := qb.Get()
-func (qb *QueryBuilder[T]) OrderBy(field string, ascending bool) *QueryBuilder[T] {
+func (qb *MongoQueryBuilder[T]) OrderBy(field string, ascending bool) *MongoQueryBuilder[T] {
 	order := 1
 	if !ascending {
 		order = -1
@@ -185,7 +185,7 @@ func (qb *QueryBuilder[T]) OrderBy(field string, ascending bool) *QueryBuilder[T
 //	qb := db.Users()
 //	qb.opts.SetLimit(10)
 //	users, _ := qb.Get()
-func (qb *QueryBuilder[T]) Limit(n int) *QueryBuilder[T] {
+func (qb *MongoQueryBuilder[T]) Limit(n int) *MongoQueryBuilder[T] {
 	if n <= 0 {
 		qb.limit = nil
 	} else {
@@ -210,7 +210,7 @@ func (qb *QueryBuilder[T]) Limit(n int) *QueryBuilder[T] {
 //	qb := db.Users()
 //	qb.projection = bson.M{"name": 1, "email": 1}
 //	users, _ := qb.Get()
-func (qb *QueryBuilder[T]) Select(fields ...string) *QueryBuilder[T] {
+func (qb *MongoQueryBuilder[T]) Select(fields ...string) *MongoQueryBuilder[T] {
 	if len(fields) == 0 {
 		qb.projection = nil
 		return qb
@@ -239,7 +239,7 @@ func (qb *QueryBuilder[T]) Select(fields ...string) *QueryBuilder[T] {
 //	qb.skip = 0
 //	qb.limit = 10
 //	users, total, err := qb.Get()
-func (qb *QueryBuilder[T]) Paginate(page, limit int) ([]T, int64, error) {
+func (qb *MongoQueryBuilder[T]) Paginate(page, limit int) ([]T, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -273,7 +273,7 @@ func (qb *QueryBuilder[T]) Paginate(page, limit int) ([]T, int64, error) {
 //	qb.skip = 0
 //	qb.limit = 10
 //	users, total, err := qb.getWithPagination()
-func (qb *QueryBuilder[T]) getWithPagination() ([]T, int64, error) {
+func (qb *MongoQueryBuilder[T]) getWithPagination() ([]T, int64, error) {
 	total, err := qb.service.Collection.CountDocuments(qb.service.Ctx, qb.filter)
 	if err != nil {
 		return nil, 0, err
@@ -342,7 +342,7 @@ func (qb *QueryBuilder[T]) getWithPagination() ([]T, int64, error) {
 //	qb.skip = 0
 //	qb.limit = 10
 //	users, err := qb.Get()
-func (qb *QueryBuilder[T]) Get() ([]T, error) {
+func (qb *MongoQueryBuilder[T]) Get() ([]T, error) {
 	opts := options.Find()
 	if qb.limit != nil {
 		opts.SetLimit(*qb.limit)
@@ -407,7 +407,7 @@ func (qb *QueryBuilder[T]) Get() ([]T, error) {
 //	qb := db.Users().Where(bson.M{"deleted_at": nil})
 //	opts := options.FindOne()
 //	user, err := qb.service.Collection.FindOne(qb.service.Ctx, qb.filter, opts).Decode(&user)
-func (qb *QueryBuilder[T]) First() (T, error) {
+func (qb *MongoQueryBuilder[T]) First() (T, error) {
 	opts := options.FindOne()
 	if qb.projection != nil {
 		opts.SetProjection(qb.projection)
@@ -447,7 +447,7 @@ func (qb *QueryBuilder[T]) First() (T, error) {
 //	    // do something with the user
 //	    return nil
 //	})
-func (qb *QueryBuilder[T]) Each(fn func(T) error) error {
+func (qb *MongoQueryBuilder[T]) Each(fn func(T) error) error {
 	cursor, err := qb.service.Collection.Find(qb.service.Ctx, qb.filter, qb.opts)
 	if err != nil {
 		return err
@@ -497,7 +497,7 @@ func (qb *QueryBuilder[T]) Each(fn func(T) error) error {
 //	    // do something with the users
 //	    return nil
 //	})
-func (qb *QueryBuilder[T]) Chunk(chunkSize int, fn func([]T) error) error {
+func (qb *MongoQueryBuilder[T]) Chunk(chunkSize int, fn func([]T) error) error {
 	if chunkSize <= 0 {
 		return errors.New("chunk size must be > 0")
 	}
@@ -532,7 +532,7 @@ func (qb *QueryBuilder[T]) Chunk(chunkSize int, fn func([]T) error) error {
 // and then retrieves the first matching document using the First() method.
 //
 // Returns the document of type T and an error if any occurs during the operation.
-func (qb *QueryBuilder[T]) Find(id any) (T, error) {
+func (qb *MongoQueryBuilder[T]) Find(id any) (T, error) {
 	var objID primitive.ObjectID
 	var err error
 
@@ -556,7 +556,7 @@ func (qb *QueryBuilder[T]) Find(id any) (T, error) {
 }
 
 // Insert inserts a new document into the collection
-func (qb *QueryBuilder[T]) Insert(model T) error {
+func (qb *MongoQueryBuilder[T]) Insert(model T) error {
 	model.SetTimestampsOnCreate()
 	model.SetID(primitive.NewObjectID())
 	_, err := qb.service.Collection.InsertOne(qb.service.Ctx, model)
@@ -564,7 +564,7 @@ func (qb *QueryBuilder[T]) Insert(model T) error {
 }
 
 // Update updates documents matching the current filter
-func (qb *QueryBuilder[T]) Update(data bson.M) error {
+func (qb *MongoQueryBuilder[T]) Update(data bson.M) error {
 	data["updated_at"] = time.Now()
 	update := bson.M{"$set": data}
 	_, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, update)
@@ -572,7 +572,7 @@ func (qb *QueryBuilder[T]) Update(data bson.M) error {
 }
 
 // UpdateByID updates a document by its ID
-func (qb *QueryBuilder[T]) UpdateByID(id string, data any) error {
+func (qb *MongoQueryBuilder[T]) UpdateByID(id string, data any) error {
 	objID, err := primitive.ObjectIDFromHex(id)
 	if err != nil {
 		return errors.New("invalid ID")
@@ -583,7 +583,7 @@ func (qb *QueryBuilder[T]) UpdateByID(id string, data any) error {
 }
 
 // Delete performs a soft delete by setting deleted_at timestamp
-func (qb *QueryBuilder[T]) Delete() error {
+func (qb *MongoQueryBuilder[T]) Delete() error {
 	now := time.Now()
 	update := bson.M{"$set": bson.M{"deleted_at": now}}
 	_, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, update)
@@ -591,14 +591,14 @@ func (qb *QueryBuilder[T]) Delete() error {
 }
 
 // Restore clears the deleted_at field on soft-deleted documents
-func (qb *QueryBuilder[T]) Restore() error {
+func (qb *MongoQueryBuilder[T]) Restore() error {
 	update := bson.M{"$set": bson.M{"deleted_at": time.Time{}}}
 	_, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, update)
 	return err
 }
 
 // ForceDelete permanently deletes documents matching the current filter
-func (qb *QueryBuilder[T]) ForceDelete() error {
+func (qb *MongoQueryBuilder[T]) ForceDelete() error {
 	_, err := qb.service.Collection.DeleteMany(qb.service.Ctx, qb.filter)
 	return err
 }
@@ -642,7 +642,7 @@ type BaseServiceInterface[T GlobalModels.ORMModel] interface {
 	ForceDelete(id string) error
 
 	// Query builder and advanced queries
-	Query() *QueryBuilder[T]
+	Query() *MongoQueryBuilder[T]
 
 	// Additional helpers
 	UpdateOrCreate(id string, updates bson.M) (T, error)
@@ -710,20 +710,20 @@ func NewBaseService[T GlobalModels.ORMModel](ctx context.Context, db *mongo.Data
 	return baseService
 }
 
-// Query returns a QueryBuilder instance for this service.
+// Query returns a MongoQueryBuilder instance for this service.
 //
-// The QueryBuilder will have a default filter of "deleted_at = null" and no
+// The MongoQueryBuilder will have a default filter of "deleted_at = null" and no
 // additional options.
 //
-// This is a convenience method for creating a QueryBuilder instance with a
+// This is a convenience method for creating a MongoQueryBuilder instance with a
 // default filter and options.
 //
 // Example:
 //
 //	qb := db.Users().Query()
 //	users, _ := qb.Get()
-func (s *BaseService[T]) Query() *QueryBuilder[T] {
-	return &QueryBuilder[T]{
+func (s *BaseService[T]) Query() *MongoQueryBuilder[T] {
+	return &MongoQueryBuilder[T]{
 		service: s,
 		filter: bson.M{
 			"deleted_at": time.Time{},
@@ -991,7 +991,7 @@ func (s *BaseService[T]) findWithFilter(filter bson.M) ([]T, error) {
 	return results, nil
 }
 
-// paginate helper used by QueryBuilder.Paginate
+// paginate helper used by MongoQueryBuilder.Paginate
 func (s *BaseService[T]) paginate(filter bson.M, page, limit int) ([]T, int64, error) {
 	skip := (page - 1) * limit
 	total, err := s.Collection.CountDocuments(s.Ctx, filter)
