@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	GlobalModels "github.com/venomous-maker/go-eloquent/src/Global/Models"
 	StringLibs "github.com/venomous-maker/go-eloquent/src/Libs/Strings"
 	"go.mongodb.org/mongo-driver/bson"
@@ -15,345 +16,504 @@ import (
 	"time"
 )
 
-// MongoQueryBuilder is a struct for query building
-// It is a chainable struct
+// ========================
+// BaseEloquentService (Laravel-inspired for MongoDB)
+// ========================
+type BaseEloquentService[T GlobalModels.ORMModel] struct {
+	Ctx            context.Context
+	DB             *mongo.Database
+	Collection     *mongo.Collection
+	Factory        func() T
+	CollectionName string
+
+	// Laravel-style lifecycle hooks
+	Creating  func(model T) error
+	Created   func(model T) error
+	Updating  func(model T) error
+	Updated   func(model T) error
+	Saving    func(model T) error
+	Saved     func(model T) error
+	Deleting  func(model T) error
+	Deleted   func(model T) error
+	Restoring func(model T) error
+	Restored  func(model T) error
+	Retrieved func(model T) error
+
+	// Laravel-style global scopes
+	GlobalScopes map[string]func(*MongoQueryBuilder[T]) *MongoQueryBuilder[T]
+}
+
+func NewEloquentService[T GlobalModels.ORMModel](ctx context.Context, db *mongo.Database, factory func() T) *BaseEloquentService[T] {
+	model := factory()
+	collectionName := model.GetTable()
+	if collectionName == "" {
+		t := reflect.TypeOf(model)
+		if t.Kind() == reflect.Ptr {
+			t = t.Elem()
+		}
+		collectionName = StringLibs.Pluralize(StringLibs.ConvertToSnakeCase(t.Name()))
+	}
+
+	collection := db.Collection(collectionName)
+
+	return &BaseEloquentService[T]{
+		Ctx:            ctx,
+		DB:             db,
+		Collection:     collection,
+		Factory:        factory,
+		CollectionName: collectionName,
+		GlobalScopes:   make(map[string]func(*MongoQueryBuilder[T]) *MongoQueryBuilder[T]),
+	}
+}
+
+// ========================
+// Laravel-Style Query Builder for MongoDB
+// ========================
 type MongoQueryBuilder[T GlobalModels.ORMModel] struct {
-	service    *BaseService[T]
-	filter     bson.M
-	opts       *options.FindOptions
-	projection bson.M
-	order      bson.D
-	limit      *int64
-	skip       *int64
+	service     *BaseEloquentService[T]
+	filter      bson.M
+	sort        bson.D
+	limit       int64
+	skip        int64
+	projection  bson.M
+	scopes      []string
+	withTrashed bool
+	onlyTrashed bool
+	forceDelete bool
 }
 
-// CollectionName returns the name of the MongoDB collection associated with
-// the MongoQueryBuilder.
-//
-// Returns:
-//
-//	string: The name of the MongoDB collection used by the MongoQueryBuilder.
-func (qb *MongoQueryBuilder[T]) CollectionName() string {
-	return qb.service.GetCollectionName()
+// ========================
+// Laravel-Style Query Builder Methods
+// ========================
+func (s *BaseEloquentService[T]) NewQuery() *MongoQueryBuilder[T] {
+	qb := &MongoQueryBuilder[T]{
+		service:    s,
+		filter:     bson.M{},
+		sort:       bson.D{},
+		limit:      0,
+		skip:       0,
+		projection: bson.M{},
+		scopes:     []string{},
+	}
+
+	// Apply global scopes
+	for name, scope := range s.GlobalScopes {
+		qb.scopes = append(qb.scopes, name)
+		qb = scope(qb)
+	}
+
+	// Apply soft delete scope by default
+	model := s.Factory()
+	if model.IsSoftDeletes() {
+		deletedAtCol := model.GetDeletedAtColumn()
+		qb.filter[deletedAtCol] = bson.M{"$exists": false}
+	}
+
+	return qb
 }
 
-// GetCollection returns the MongoDB collection associated with the MongoQueryBuilder.
-//
-// This method retrieves the collection from the underlying service, allowing
-// direct access to the MongoDB collection for advanced operations.
-//
-// Returns:
-//
-//	*mongo.Collection: The MongoDB collection used by the MongoQueryBuilder.
-func (qb *MongoQueryBuilder[T]) GetCollection() *mongo.Collection {
-	return qb.service.GetCollection()
+// Laravel Query() method
+func (s *BaseEloquentService[T]) Query() *MongoQueryBuilder[T] {
+	return s.NewQuery()
 }
 
-// Apply is a method to apply a scope to the query builder.
-//
-// Example:
-//
-//	qb := db.Users().Where(bson.M{"age": bson.M{"$gt": 18}})
-//	qb = qb.Apply(func(qb *MongoQueryBuilder[User]) *MongoQueryBuilder[User] {
-//	    qb = qb.WithTrashed()
-//	    return qb
-//	})
-//
-// This is equivalent to:
-//
-//	qb := db.Users().Where(bson.M{"age": bson.M{"$gt": 18}}).WithTrashed()
-func (qb *MongoQueryBuilder[T]) Apply(scope func(*MongoQueryBuilder[T]) *MongoQueryBuilder[T]) *MongoQueryBuilder[T] {
-	return scope(qb)
+// ========================
+// Where Clauses (Laravel-style)
+// ========================
+func (qb *MongoQueryBuilder[T]) Where(column string, args ...interface{}) *MongoQueryBuilder[T] {
+	var operator string = "="
+	var value interface{}
+
+	switch len(args) {
+	case 1:
+		value = args[0]
+	case 2:
+		operator = args[0].(string)
+		value = args[1]
+	}
+
+	switch operator {
+	case "=":
+		qb.filter[column] = value
+	case "!=", "<>":
+		qb.filter[column] = bson.M{"$ne": value}
+	case ">":
+		qb.filter[column] = bson.M{"$gt": value}
+	case ">=":
+		qb.filter[column] = bson.M{"$gte": value}
+	case "<":
+		qb.filter[column] = bson.M{"$lt": value}
+	case "<=":
+		qb.filter[column] = bson.M{"$lte": value}
+	case "like":
+		// Convert SQL LIKE to MongoDB regex
+		pattern := strings.ReplaceAll(value.(string), "%", ".*")
+		qb.filter[column] = bson.M{"$regex": pattern, "$options": "i"}
+	case "not like":
+		pattern := strings.ReplaceAll(value.(string), "%", ".*")
+		qb.filter[column] = bson.M{"$not": bson.M{"$regex": pattern, "$options": "i"}}
+	default:
+		qb.filter[column] = value
+	}
+
+	return qb
 }
 
-// Where adds a condition to the query filter.
-//
-// Example:
-//
-//	qb := db.Users().Where(bson.M{"age": bson.M{"$gt": 18}})
-//	qb = qb.Where(bson.M{"deleted_at": nil})
-//
-// This is equivalent to:
-//
-//	qb := db.Users().Where(bson.M{
-//	    "age": bson.M{"$gt": 18},
-//	    "deleted_at": nil,
-//	})
-func (qb *MongoQueryBuilder[T]) Where(condition bson.M) *MongoQueryBuilder[T] {
-	for k, v := range condition {
+func (qb *MongoQueryBuilder[T]) OrWhere(conditions ...bson.M) *MongoQueryBuilder[T] {
+	if len(conditions) == 0 {
+		return qb
+	}
+
+	if existingOr, exists := qb.filter["$or"]; exists {
+		// Add to existing $or
+		orArray := existingOr.([]bson.M)
+		qb.filter["$or"] = append(orArray, conditions...)
+	} else {
+		// Check if we need to wrap existing conditions
+		if len(qb.filter) > 0 {
+			existingConditions := bson.M{}
+			for k, v := range qb.filter {
+				existingConditions[k] = v
+			}
+			qb.filter = bson.M{
+				"$or": append([]bson.M{existingConditions}, conditions...),
+			}
+		} else {
+			qb.filter["$or"] = conditions
+		}
+	}
+
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereIn(column string, values []interface{}) *MongoQueryBuilder[T] {
+	qb.filter[column] = bson.M{"$in": values}
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereNotIn(column string, values []interface{}) *MongoQueryBuilder[T] {
+	qb.filter[column] = bson.M{"$nin": values}
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereBetween(column string, values [2]interface{}) *MongoQueryBuilder[T] {
+	qb.filter[column] = bson.M{
+		"$gte": values[0],
+		"$lte": values[1],
+	}
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereNotBetween(column string, values [2]interface{}) *MongoQueryBuilder[T] {
+	qb.filter[column] = bson.M{
+		"$not": bson.M{
+			"$gte": values[0],
+			"$lte": values[1],
+		},
+	}
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) whereNull(column string) *MongoQueryBuilder[T] {
+	qb.filter[column] = bson.M{"$exists": false}
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereNull(column string) *MongoQueryBuilder[T] {
+	return qb.whereNull(column)
+}
+
+func (qb *MongoQueryBuilder[T]) WhereNotNull(column string) *MongoQueryBuilder[T] {
+	qb.filter[column] = bson.M{"$exists": true}
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereDate(column string, operator string, value interface{}) *MongoQueryBuilder[T] {
+	// For MongoDB, we need to handle date comparisons differently
+	var startDate, endDate time.Time
+
+	switch v := value.(type) {
+	case string:
+		if parsed, err := time.Parse("2006-01-02", v); err == nil {
+			startDate = parsed
+			endDate = parsed.Add(24 * time.Hour).Add(-time.Nanosecond)
+		}
+	case time.Time:
+		startDate = time.Date(v.Year(), v.Month(), v.Day(), 0, 0, 0, 0, v.Location())
+		endDate = startDate.Add(24 * time.Hour).Add(-time.Nanosecond)
+	}
+
+	switch operator {
+	case "=":
+		qb.filter[column] = bson.M{"$gte": startDate, "$lte": endDate}
+	case ">":
+		qb.filter[column] = bson.M{"$gt": endDate}
+	case ">=":
+		qb.filter[column] = bson.M{"$gte": startDate}
+	case "<":
+		qb.filter[column] = bson.M{"$lt": startDate}
+	case "<=":
+		qb.filter[column] = bson.M{"$lte": endDate}
+	}
+
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereTime(column string, operator string, value interface{}) *MongoQueryBuilder[T] {
+	// Extract time part using MongoDB aggregation
+	// This is more complex in MongoDB - for now, we'll do a basic comparison
+	return qb.Where(column, operator, value)
+}
+
+func (qb *MongoQueryBuilder[T]) WhereYear(column string, operator string, value interface{}) *MongoQueryBuilder[T] {
+	year, ok := value.(int)
+	if !ok {
+		return qb
+	}
+
+	startDate := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+	endDate := time.Date(year+1, 1, 1, 0, 0, 0, 0, time.UTC).Add(-time.Nanosecond)
+
+	switch operator {
+	case "=":
+		qb.filter[column] = bson.M{"$gte": startDate, "$lt": endDate}
+	case ">":
+		qb.filter[column] = bson.M{"$gte": endDate}
+	case ">=":
+		qb.filter[column] = bson.M{"$gte": startDate}
+	case "<":
+		qb.filter[column] = bson.M{"$lt": startDate}
+	case "<=":
+		qb.filter[column] = bson.M{"$lt": endDate}
+	}
+
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereMonth(column string, operator string, value interface{}) *MongoQueryBuilder[T] {
+	month, ok := value.(int)
+	if !ok || month < 1 || month > 12 {
+		return qb
+	}
+
+	// This is simplified - in production, you might want to handle years too
+	qb.filter[column] = bson.M{
+		"$expr": bson.M{
+			"$eq": []interface{}{
+				bson.M{"$month": "$" + column},
+				month,
+			},
+		},
+	}
+
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereDay(column string, operator string, value interface{}) *MongoQueryBuilder[T] {
+	day, ok := value.(int)
+	if !ok || day < 1 || day > 31 {
+		return qb
+	}
+
+	qb.filter[column] = bson.M{
+		"$expr": bson.M{
+			"$eq": []interface{}{
+				bson.M{"$dayOfMonth": "$" + column},
+				day,
+			},
+		},
+	}
+
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereExists(subquery func(*MongoQueryBuilder[T]) *MongoQueryBuilder[T]) *MongoQueryBuilder[T] {
+	// MongoDB doesn't have direct EXISTS - this would need to be implemented
+	// based on specific use case using $lookup or other aggregation operators
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereRaw(filter bson.M) *MongoQueryBuilder[T] {
+	for k, v := range filter {
 		qb.filter[k] = v
 	}
 	return qb
 }
 
-// WithTrashed includes soft-deleted records in the query result.
-//
-// By default, queries exclude soft-deleted documents (where "deleted_at" is not null).
-// This method clears the "deleted_at = null" condition to include both active and deleted records.
-//
-// Example:
-//
-//	qb := db.Users().WithTrashed()
-//	users, _ := qb.Get()
-//
-// This is equivalent to removing the filter:
-//
-//	qb := db.Users()
-//	qb.IgnoreDeletedAtFilter()
-//	users, _ := qb.Get()
-func (qb *MongoQueryBuilder[T]) WithTrashed() *MongoQueryBuilder[T] {
-	delete(qb.filter, "deleted_at")
-	return qb
-}
-
-// OnlyTrashed excludes active records from the query result.
-//
-// This method adds a filter "deleted_at != null" to include only soft-deleted documents.
-//
-// Example:
-//
-//	qb := db.Users().OnlyTrashed()
-//	users, _ := qb.Get()
-//
-// This is equivalent to adding the filter:
-//
-//	qb := db.Users()
-//	qb.filter["deleted_at"] = bson.M{"$ne": time.Time{}}
-//	users, _ := qb.Get()
-func (qb *MongoQueryBuilder[T]) OnlyTrashed() *MongoQueryBuilder[T] {
-	qb.filter["deleted_at"] = bson.M{"$ne": time.Time{}}
-	return qb
-}
-
-// Active excludes soft-deleted records from the query result.
-//
-// This method adds a filter "deleted_at = null" to include only active documents.
-//
-// Example:
-//
-//	qb := db.Users().Active()
-//	users, _ := qb.Get()
-//
-// This is equivalent to adding the filter:
-//
-//	qb := db.Users()
-//	qb.filter["deleted_at"] = time.Time{}
-//	users, _ := qb.Get()
-func (qb *MongoQueryBuilder[T]) Active() *MongoQueryBuilder[T] {
-	qb.filter["deleted_at"] = time.Time{}
-	return qb
-}
-
-// OrderBy adds a sort order to the query.
-//
-// The field parameter specifies the field to sort by. The ascending parameter
-// specifies whether the sort order is ascending or descending.
-//
-// The method returns the modified MongoQueryBuilder.
-//
-// Example:
-//
-//	qb := db.Users().OrderBy("age", true)
-//	users, _ := qb.Get()
-//
-// This is equivalent to:
-//
-//	qb := db.Users()
-//	qb.order = append(qb.order, bson.E{Key: "age", Value: 1})
-//	users, _ := qb.Get()
-func (qb *MongoQueryBuilder[T]) OrderBy(field string, ascending bool) *MongoQueryBuilder[T] {
-	order := 1
-	if !ascending {
-		order = -1
+// ========================
+// Ordering (Laravel-style)
+// ========================
+func (qb *MongoQueryBuilder[T]) OrderBy(column string, direction ...string) *MongoQueryBuilder[T] {
+	dir := 1 // ascending
+	if len(direction) > 0 && strings.ToLower(direction[0]) == "desc" {
+		dir = -1
 	}
-	qb.order = append(qb.order, bson.E{Key: field, Value: order})
+
+	qb.sort = append(qb.sort, bson.E{Key: column, Value: dir})
 	return qb
 }
 
-// Limit sets the limit for the query result.
-//
-// The method sets the limit for the number of documents to return.
-// If the limit is set to 0, the limit is removed.
-//
-// Example:
-//
-//	qb := db.Users().Limit(10)
-//	users, _ := qb.Get()
-//
-// This is equivalent to:
-//
-//	qb := db.Users()
-//	qb.opts.SetLimit(10)
-//	users, _ := qb.Get()
-func (qb *MongoQueryBuilder[T]) Limit(n int) *MongoQueryBuilder[T] {
-	if n <= 0 {
-		qb.limit = nil
-	} else {
-		n64 := int64(n)
-		qb.limit = &n64
+func (qb *MongoQueryBuilder[T]) OrderByDesc(column string) *MongoQueryBuilder[T] {
+	return qb.OrderBy(column, "desc")
+}
+
+func (qb *MongoQueryBuilder[T]) Latest(column ...string) *MongoQueryBuilder[T] {
+	col := "created_at"
+	if len(column) > 0 {
+		col = column[0]
 	}
+	return qb.OrderByDesc(col)
+}
+
+func (qb *MongoQueryBuilder[T]) Oldest(column ...string) *MongoQueryBuilder[T] {
+	col := "created_at"
+	if len(column) > 0 {
+		col = column[0]
+	}
+	return qb.OrderBy(col)
+}
+
+func (qb *MongoQueryBuilder[T]) InRandomOrder() *MongoQueryBuilder[T] {
+	// MongoDB equivalent of random order using $sample in aggregation
+	// This is a simplified version - in practice, you'd use aggregation pipeline
 	return qb
 }
 
-// Select specifies the fields to include in the query result.
-//
-// This method updates the projection of the query to include only the specified fields.
-// If no fields are provided, the projection is cleared.
-//
-// Example:
-//
-//	qb := db.Users().Select("name", "email")
-//	users, _ := qb.Get()
-//
-// This is equivalent to setting the projection:
-//
-//	qb := db.Users()
-//	qb.projection = bson.M{"name": 1, "email": 1}
-//	users, _ := qb.Get()
+// ========================
+// Limiting and Offsetting
+// ========================
+func (qb *MongoQueryBuilder[T]) Take(count int) *MongoQueryBuilder[T] {
+	qb.limit = int64(count)
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) Limit(count int) *MongoQueryBuilder[T] {
+	return qb.Take(count)
+}
+
+func (qb *MongoQueryBuilder[T]) Skip(count int) *MongoQueryBuilder[T] {
+	qb.skip = int64(count)
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) Offset(count int) *MongoQueryBuilder[T] {
+	return qb.Skip(count)
+}
+
+// ========================
+// Selecting Fields (Projection)
+// ========================
 func (qb *MongoQueryBuilder[T]) Select(fields ...string) *MongoQueryBuilder[T] {
-	if len(fields) == 0 {
-		qb.projection = nil
-		return qb
+	qb.projection = bson.M{}
+	for _, field := range fields {
+		if field != "*" {
+			qb.projection[field] = 1
+		}
 	}
-	proj := bson.M{}
-	for _, f := range fields {
-		proj[f] = 1
-	}
-	qb.projection = proj
 	return qb
 }
 
-// Paginate applies pagination to the query with the given page and limit.
-//
-// It will use the default page (1) and limit (10) if the provided values are less than 1.
-// The total count of documents is also returned.
-//
-// Example:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	users, total, err := qb.Paginate(1, 10)
-//
-// This is equivalent to:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	qb.skip = 0
-//	qb.limit = 10
-//	users, total, err := qb.Get()
-func (qb *MongoQueryBuilder[T]) Paginate(page, limit int) ([]T, int64, error) {
-	if page < 1 {
-		page = 1
+func (qb *MongoQueryBuilder[T]) AddSelect(fields ...string) *MongoQueryBuilder[T] {
+	if len(qb.projection) == 0 {
+		qb.projection = bson.M{}
 	}
-	if limit < 1 {
-		limit = 10
+	for _, field := range fields {
+		if field != "*" {
+			qb.projection[field] = 1
+		}
 	}
-	skip := int64((page - 1) * limit)
-	qb.skip = &skip
-	n64 := int64(limit)
-	qb.limit = &n64
-
-	return qb.getWithPagination()
+	return qb
 }
 
-// getWithPagination executes the query with pagination.
-//
-// It first counts the total number of documents with the given filter.
-// Then it executes the query with the given options and returns the result.
-// The result will be paginated according to the `skip` and `limit` fields.
-// If the `skip` or `limit` fields are not set, the default values will be used.
-// The total count of documents is also returned.
-//
-// Example:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	users, total, err := qb.getWithPagination()
-//
-// This is equivalent to:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	qb.skip = 0
-//	qb.limit = 10
-//	users, total, err := qb.getWithPagination()
-func (qb *MongoQueryBuilder[T]) getWithPagination() ([]T, int64, error) {
-	total, err := qb.service.Collection.CountDocuments(qb.service.Ctx, qb.filter)
-	if err != nil {
-		return nil, 0, err
+func (qb *MongoQueryBuilder[T]) Exclude(fields ...string) *MongoQueryBuilder[T] {
+	if len(qb.projection) == 0 {
+		qb.projection = bson.M{}
 	}
-
-	opts := options.Find()
-	if qb.limit != nil {
-		opts.SetLimit(*qb.limit)
+	for _, field := range fields {
+		qb.projection[field] = 0
 	}
-	if qb.skip != nil {
-		opts.SetSkip(*qb.skip)
-	}
-	if len(qb.order) > 0 {
-		opts.SetSort(qb.order)
-	}
-	if qb.projection != nil {
-		opts.SetProjection(qb.projection)
-	}
-
-	cursor, err := qb.service.Collection.Find(qb.service.Ctx, qb.filter, opts)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer func(cursor *mongo.Cursor, ctx context.Context) {
-		err := cursor.Close(ctx)
-		if err != nil {
-			return
-		}
-	}(cursor, qb.service.Ctx)
-
-	var results []T
-	for cursor.Next(qb.service.Ctx) {
-		obj := qb.service.Factory()
-		if qb.service.BeforeFetch != nil {
-			if err := qb.service.BeforeFetch(obj); err != nil {
-				continue
-			}
-		}
-		if err := cursor.Decode(obj); err == nil {
-			results = append(results, obj)
-		}
-		if qb.service.AfterFetch != nil {
-			if err := qb.service.AfterFetch(obj); err != nil {
-				continue
-			}
-		}
-	}
-	return results, total, nil
+	return qb
 }
 
-// Get executes the query and returns the results.
-//
-// It will use the default query options if none are provided.
-// The results will be paginated according to the `skip` and `limit` fields.
-// If the `skip` or `limit` fields are not set, the default values will be used.
-// The total count of documents is also returned.
-//
-// Example:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	users, err := qb.Get()
-//
-// This is equivalent to:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	qb.skip = 0
-//	qb.limit = 10
-//	users, err := qb.Get()
+// ========================
+// Soft Deletes (Laravel-style)
+// ========================
+func (qb *MongoQueryBuilder[T]) WithTrashed() *MongoQueryBuilder[T] {
+	qb.withTrashed = true
+	qb.onlyTrashed = false
+
+	model := qb.service.Factory()
+	if model.IsSoftDeletes() {
+		deletedAtCol := model.GetDeletedAtColumn()
+		delete(qb.filter, deletedAtCol)
+	}
+
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WithoutTrashed() *MongoQueryBuilder[T] {
+	qb.withTrashed = false
+	qb.onlyTrashed = false
+
+	model := qb.service.Factory()
+	if model.IsSoftDeletes() {
+		deletedAtCol := model.GetDeletedAtColumn()
+		qb.filter[deletedAtCol] = bson.M{"$exists": false}
+	}
+
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) OnlyTrashed() *MongoQueryBuilder[T] {
+	qb.onlyTrashed = true
+	qb.withTrashed = false
+
+	model := qb.service.Factory()
+	if model.IsSoftDeletes() {
+		deletedAtCol := model.GetDeletedAtColumn()
+		qb.filter[deletedAtCol] = bson.M{"$exists": true}
+	}
+
+	return qb
+}
+
+// ========================
+// Scopes (Laravel-style)
+// ========================
+func (qb *MongoQueryBuilder[T]) Scope(name string, scope func(*MongoQueryBuilder[T]) *MongoQueryBuilder[T]) *MongoQueryBuilder[T] {
+	return scope(qb)
+}
+
+func (qb *MongoQueryBuilder[T]) When(condition bool, callback func(*MongoQueryBuilder[T]) *MongoQueryBuilder[T]) *MongoQueryBuilder[T] {
+	if condition {
+		return callback(qb)
+	}
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) Unless(condition bool, callback func(*MongoQueryBuilder[T]) *MongoQueryBuilder[T]) *MongoQueryBuilder[T] {
+	if !condition {
+		return callback(qb)
+	}
+	return qb
+}
+
+// ========================
+// Result Retrieval (Laravel-style)
+// ========================
 func (qb *MongoQueryBuilder[T]) Get() ([]T, error) {
 	opts := options.Find()
-	if qb.limit != nil {
-		opts.SetLimit(*qb.limit)
+
+	if len(qb.sort) > 0 {
+		opts.SetSort(qb.sort)
 	}
-	if qb.skip != nil {
-		opts.SetSkip(*qb.skip)
+	if qb.limit > 0 {
+		opts.SetLimit(qb.limit)
 	}
-	if len(qb.order) > 0 {
-		opts.SetSort(qb.order)
+	if qb.skip > 0 {
+		opts.SetSkip(qb.skip)
 	}
-	if qb.projection != nil {
+	if len(qb.projection) > 0 {
 		opts.SetProjection(qb.projection)
 	}
 
@@ -364,752 +524,1070 @@ func (qb *MongoQueryBuilder[T]) Get() ([]T, error) {
 	defer func(cursor *mongo.Cursor, ctx context.Context) {
 		err := cursor.Close(ctx)
 		if err != nil {
-			return
+
 		}
 	}(cursor, qb.service.Ctx)
 
 	var results []T
 	for cursor.Next(qb.service.Ctx) {
-		obj := qb.service.Factory()
-		if qb.service.BeforeFetch != nil {
-			if err := qb.service.BeforeFetch(obj); err != nil {
+		model := qb.service.Factory()
+
+		if err := cursor.Decode(&model); err != nil {
+			continue
+		}
+
+		// Execute Retrieved hook
+		if qb.service.Retrieved != nil {
+			if err := qb.service.Retrieved(model); err != nil {
 				continue
 			}
 		}
-		if err := cursor.Decode(obj); err == nil {
-			results = append(results, obj)
-		}
-		if qb.service.AfterFetch != nil {
-			if err := qb.service.AfterFetch(obj); err != nil {
-				continue
-			}
-		}
+
+		results = append(results, model)
 	}
-	return results, nil
+
+	return results, cursor.Err()
 }
 
-// First executes the query and returns the first document.
-//
-// It will use the default query options if none are provided.
-// The results will be paginated according to the `skip` and `limit` fields.
-// If the `skip` or `limit` fields are not set, the default values will be used.
-// The total count of documents is also returned.
-//
-// If no documents are found, the zero value of T will be returned, and an error of `mongo.ErrNoDocuments` will be returned.
-//
-// Example:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	user, err := qb.First()
-//
-// This is equivalent to:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	opts := options.FindOne()
-//	user, err := qb.service.Collection.FindOne(qb.service.Ctx, qb.filter, opts).Decode(&user)
 func (qb *MongoQueryBuilder[T]) First() (T, error) {
-	opts := options.FindOne()
-	if qb.projection != nil {
-		opts.SetProjection(qb.projection)
-	}
 	var zero T
-	obj := qb.service.Factory()
-	if qb.service.BeforeFetch != nil {
-		if err := qb.service.BeforeFetch(obj); err != nil {
-			return zero, err
-		}
+	results, err := qb.Take(1).Get()
+	if err != nil || len(results) == 0 {
+		return zero, errors.New("no records found")
 	}
-	err := qb.service.Collection.FindOne(qb.service.Ctx, qb.filter, opts).Decode(obj)
+	return results[0], nil
+}
+
+func (qb *MongoQueryBuilder[T]) FirstOrFail() (T, error) {
+	result, err := qb.First()
 	if err != nil {
-		return zero, err
-	}
-	if qb.service.AfterFetch != nil {
-		if err := qb.service.AfterFetch(obj); err != nil {
-			return zero, err
-		}
-	}
-	return obj, nil
-}
-
-// Each calls the provided function for each document in the result set.
-//
-// It will use the default query options if none are provided.
-// The results will be paginated according to the `skip` and `limit` fields.
-// If the `skip` or `limit` fields are not set, the default values will be used.
-//
-// The provided function will be called once for each document in the result set.
-// If the function returns an error, the iteration will stop and the error will be returned.
-//
-// Example:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	err := qb.Each(func(user models.User) error {
-//	    // do something with the user
-//	    return nil
-//	})
-func (qb *MongoQueryBuilder[T]) Each(fn func(T) error) error {
-	cursor, err := qb.service.Collection.Find(qb.service.Ctx, qb.filter, qb.opts)
-	if err != nil {
-		return err
-	}
-	defer func(cursor *mongo.Cursor, ctx context.Context) {
-		err := cursor.Close(ctx)
-		if err != nil {
-			return
-		}
-	}(cursor, qb.service.Ctx)
-
-	for cursor.Next(qb.service.Ctx) {
-		obj := qb.service.Factory()
-		if qb.service.BeforeFetch != nil {
-			if err := qb.service.BeforeFetch(obj); err != nil {
-				continue
-			}
-		}
-		if err := cursor.Decode(obj); err == nil {
-			if qb.service.AfterFetch != nil {
-				if err := qb.service.AfterFetch(obj); err != nil {
-					continue
-				}
-			}
-			if err := fn(obj); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// Chunk executes the query and passes chunks of the result set to the
-// provided function. The chunks are of the given size.
-//
-// It will use the default query options if none are provided.
-// The results will be paginated according to the `skip` and `limit` fields.
-// If the `skip` or `limit` fields are not set, the default values will be used.
-//
-// The provided function will be called once for each chunk of the result set.
-// If the function returns an error, the iteration will stop and the error will be returned.
-//
-// Example:
-//
-//	qb := db.Users().Where(bson.M{"deleted_at": nil})
-//	err := qb.Chunk(10, func(users []models.User) error {
-//	    // do something with the users
-//	    return nil
-//	})
-func (qb *MongoQueryBuilder[T]) Chunk(chunkSize int, fn func([]T) error) error {
-	if chunkSize <= 0 {
-		return errors.New("chunk size must be > 0")
-	}
-
-	var page = 1
-	for {
-		results, total, err := qb.Paginate(page, chunkSize)
-		if err != nil {
-			return err
-		}
-		if len(results) == 0 {
-			break
-		}
-		if err := fn(results); err != nil {
-			return err
-		}
-		if int64(page*chunkSize) >= total {
-			break
-		}
-		page++
-	}
-	return nil
-}
-
-// Find retrieves a single document by its ID.
-//
-// The ID can be provided as a string or a primitive.ObjectID. If the ID is a
-// string, it will be converted to a primitive.ObjectID. If the ID is invalid
-// or of an unsupported type, an error will be returned.
-//
-// The method sets the query filter to match the document with the specified ID
-// and then retrieves the first matching document using the First() method.
-//
-// Returns the document of type T and an error if any occurs during the operation.
-func (qb *MongoQueryBuilder[T]) Find(id any) (T, error) {
-	var objID primitive.ObjectID
-	var err error
-
-	switch v := id.(type) {
-	case string:
-		objID, err = primitive.ObjectIDFromHex(v)
-		if err != nil {
-			return qb.service.Factory(), errors.New("invalid ID string format")
-		}
-	case primitive.ObjectID:
-		if v.IsZero() {
-			return qb.service.Factory(), errors.New("invalid ID: zero value")
-		}
-		objID = v
-	default:
-		return qb.service.Factory(), errors.New("unsupported ID type")
-	}
-
-	qb.filter["_id"] = objID
-	return qb.First()
-}
-
-// Insert inserts a new document into the collection
-func (qb *MongoQueryBuilder[T]) Insert(model T) error {
-	model.SetTimestampsOnCreate()
-	model.SetID(primitive.NewObjectID())
-	_, err := qb.service.Collection.InsertOne(qb.service.Ctx, model)
-	return err
-}
-
-// Update updates documents matching the current filter
-func (qb *MongoQueryBuilder[T]) Update(data bson.M) error {
-	data["updated_at"] = time.Now()
-	update := bson.M{"$set": data}
-	_, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, update)
-	return err
-}
-
-// UpdateByID updates a document by its ID
-func (qb *MongoQueryBuilder[T]) UpdateByID(id string, data any) error {
-	objID, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		return errors.New("invalid ID")
-	}
-	update := bson.M{"$set": data}
-	_, err = qb.service.Collection.UpdateByID(qb.service.Ctx, objID, update)
-	return err
-}
-
-// Delete performs a soft delete by setting deleted_at timestamp
-func (qb *MongoQueryBuilder[T]) Delete() error {
-	now := time.Now()
-	update := bson.M{"$set": bson.M{"deleted_at": now}}
-	_, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, update)
-	return err
-}
-
-// Restore clears the deleted_at field on soft-deleted documents
-func (qb *MongoQueryBuilder[T]) Restore() error {
-	update := bson.M{"$set": bson.M{"deleted_at": time.Time{}}}
-	_, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, update)
-	return err
-}
-
-// ForceDelete permanently deletes documents matching the current filter
-func (qb *MongoQueryBuilder[T]) ForceDelete() error {
-	_, err := qb.service.Collection.DeleteMany(qb.service.Ctx, qb.filter)
-	return err
-}
-
-// ========================
-// BaseService
-// ========================
-
-type BaseService[T GlobalModels.ORMModel] struct {
-	Ctx        context.Context
-	DB         *mongo.Database
-	Collection *mongo.Collection
-	Factory    func() T
-
-	// Collection based
-	CollectionName string
-
-	// Lifecycle hooks
-	BeforeSave   func(model T) error
-	AfterCreate  func(model T) error
-	AfterUpdate  func(model T) error
-	BeforeDelete func(id string) error
-	AfterDelete  func(id string) error
-	BeforeFetch  func(model T) error
-	AfterFetch   func(model T) error
-}
-
-// BaseServiceInterface defines the main service operations for a model T.
-type BaseServiceInterface[T GlobalModels.ORMModel] interface {
-	// Context and Factory
-	GetCtx() context.Context
-	GetFactory() func() T
-
-	// CRUD operations
-	Find(id string) (T, error)
-	FindOrFail(id string) (T, error)
-	Save(model T) (T, error)
-	Update(id string, updates bson.M) error
-	Delete(id string) error
-	Restore(id string) error
-	ForceDelete(id string) error
-
-	// Query builder and advanced queries
-	Query() *MongoQueryBuilder[T]
-
-	// Additional helpers
-	UpdateOrCreate(id string, updates bson.M) (T, error)
-	CreateOrUpdate(model T) (T, error)
-	FirstOrCreate(filter bson.M, newData T) (T, error)
-	Reload(model T) (T, error)
-
-	// Internal / helpers exposed for interface use
-	NewInstance() BaseService[T]
-	GetCollection() *mongo.Collection
-	GetModel() T
-	NewModel() T
-
-	// Get Collection
-	GetCollectionName() string
-
-	// Get Route
-	GetRoutePrefix() string
-
-	// Serialization / Deserialization
-	ToBson(model T) (bson.M, error)
-	ToJson(model T) (map[string]interface{}, error)
-	FromBson(model *T, data bson.M) error
-	FromJson(model *T, data map[string]interface{}) error
-}
-
-// NewBaseService returns a new BaseService instance.
-//
-// The provided context will be used for all operations.
-// The provided mongo database will be used for all operations.
-// The provided factory function will be used to create new instances of the model.
-//
-// The collection name will be determined by calling the `GetCollectionName` method
-// on the model returned by the factory function.
-func NewBaseService[T GlobalModels.ORMModel](ctx context.Context, db *mongo.Database, factory func() T) *BaseService[T] {
-	model := factory()
-
-	// Define a local function to get the collection name with custom logic
-	getCollectionName := func(model T) string {
-		t := reflect.TypeOf(model)
-		if t.Kind() == reflect.Ptr {
-			t = t.Elem()
-		}
-		return StringLibs.Pluralize(StringLibs.ConvertToSnakeCase(t.Name()))
-	}
-	baseService := &BaseService[T]{
-		Ctx:        ctx,
-		DB:         db,
-		Collection: db.Collection(getCollectionName(model)),
-		Factory:    factory,
-	}
-
-	// Define a local function to get the collection name with custom logic
-	baseService.CollectionName = getCollectionName(model)
-
-	_, _ = baseService.Collection.UpdateMany(ctx, bson.M{
-		"$or": []bson.M{
-			{"deleted_at": bson.M{"$exists": false}},
-			{"deleted_at": nil},
-		},
-	}, bson.M{
-		"$set": bson.M{"deleted_at": time.Time{}},
-	})
-
-	return baseService
-}
-
-// Query returns a MongoQueryBuilder instance for this service.
-//
-// The MongoQueryBuilder will have a default filter of "deleted_at = null" and no
-// additional options.
-//
-// This is a convenience method for creating a MongoQueryBuilder instance with a
-// default filter and options.
-//
-// Example:
-//
-//	qb := db.Users().Query()
-//	users, _ := qb.Get()
-func (s *BaseService[T]) Query() *MongoQueryBuilder[T] {
-	return &MongoQueryBuilder[T]{
-		service: s,
-		filter: bson.M{
-			"deleted_at": time.Time{},
-		},
-		opts: options.Find(),
-	}
-}
-
-// Find retrieves a document by its ID.
-//
-// It converts the provided string ID to a primitive.ObjectID and searches for a document
-// with the matching "_id" and a "deleted_at" field set to the zero time value, indicating
-// that the document is active.
-//
-// Returns the document if found, or an error if the ID is invalid or the document is not found.
-func (s *BaseService[T]) Find(id string) (T, error) {
-	var zero T
-	objID, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		return zero, err
-	}
-	return s.findOne(bson.M{
-		"_id":        objID,
-		"deleted_at": time.Time{},
-	})
-}
-
-// FindOrFail by ID
-func (s *BaseService[T]) FindOrFail(id string) (T, error) {
-	result, err := s.Find(id)
-	if err != nil {
-		return result, errors.New("record with id " + id + " not found")
+		return result, errors.New("model not found")
 	}
 	return result, nil
 }
 
-// Save creates a new record with BeforeSave and AfterCreate hooks
-func (s *BaseService[T]) Save(model T) (T, error) {
-	if s.BeforeSave != nil {
-		if err := s.BeforeSave(model); err != nil {
+func (qb *MongoQueryBuilder[T]) Find(id interface{}) (T, error) {
+	// Handle both string and ObjectID
+	var objectID primitive.ObjectID
+	var err error
+
+	switch v := id.(type) {
+	case string:
+		objectID, err = primitive.ObjectIDFromHex(v)
+		if err != nil {
+			return qb.Where("_id", id).First()
+		}
+	case primitive.ObjectID:
+		objectID = v
+	default:
+		return qb.Where("_id", id).First()
+	}
+
+	return qb.Where("_id", objectID).First()
+}
+
+func (qb *MongoQueryBuilder[T]) FindOrFail(id interface{}) (T, error) {
+	result, err := qb.Find(id)
+	if err != nil {
+		return result, fmt.Errorf("no query results for model with id: %v", id)
+	}
+	return result, nil
+}
+
+func (qb *MongoQueryBuilder[T]) FindMany(ids []interface{}) ([]T, error) {
+	return qb.WhereIn("_id", ids).Get()
+}
+
+// ========================
+// Aggregates (Laravel-style)
+// ========================
+func (qb *MongoQueryBuilder[T]) Count() (int64, error) {
+	return qb.service.Collection.CountDocuments(qb.service.Ctx, qb.filter)
+}
+
+func (qb *MongoQueryBuilder[T]) Max(field string) (interface{}, error) {
+	pipeline := []bson.M{
+		{"$match": qb.filter},
+		{"$group": bson.M{
+			"_id": nil,
+			"max": bson.M{"$max": "$" + field},
+		}},
+	}
+
+	cursor, err := qb.service.Collection.Aggregate(qb.service.Ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+
+		}
+	}(cursor, qb.service.Ctx)
+
+	var result struct {
+		Max interface{} `bson:"max"`
+	}
+
+	if cursor.Next(qb.service.Ctx) {
+		if err := cursor.Decode(&result); err != nil {
+			return nil, err
+		}
+		return result.Max, nil
+	}
+
+	return nil, nil
+}
+
+func (qb *MongoQueryBuilder[T]) Min(field string) (interface{}, error) {
+	pipeline := []bson.M{
+		{"$match": qb.filter},
+		{"$group": bson.M{
+			"_id": nil,
+			"min": bson.M{"$min": "$" + field},
+		}},
+	}
+
+	cursor, err := qb.service.Collection.Aggregate(qb.service.Ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+
+		}
+	}(cursor, qb.service.Ctx)
+
+	var result struct {
+		Min interface{} `bson:"min"`
+	}
+
+	if cursor.Next(qb.service.Ctx) {
+		if err := cursor.Decode(&result); err != nil {
+			return nil, err
+		}
+		return result.Min, nil
+	}
+
+	return nil, nil
+}
+
+func (qb *MongoQueryBuilder[T]) Sum(field string) (interface{}, error) {
+	pipeline := []bson.M{
+		{"$match": qb.filter},
+		{"$group": bson.M{
+			"_id": nil,
+			"sum": bson.M{"$sum": "$" + field},
+		}},
+	}
+
+	cursor, err := qb.service.Collection.Aggregate(qb.service.Ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+
+		}
+	}(cursor, qb.service.Ctx)
+
+	var result struct {
+		Sum interface{} `bson:"sum"`
+	}
+
+	if cursor.Next(qb.service.Ctx) {
+		if err := cursor.Decode(&result); err != nil {
+			return nil, err
+		}
+		return result.Sum, nil
+	}
+
+	return 0, nil
+}
+
+func (qb *MongoQueryBuilder[T]) Avg(field string) (interface{}, error) {
+	pipeline := []bson.M{
+		{"$match": qb.filter},
+		{"$group": bson.M{
+			"_id": nil,
+			"avg": bson.M{"$avg": "$" + field},
+		}},
+	}
+
+	cursor, err := qb.service.Collection.Aggregate(qb.service.Ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+
+		}
+	}(cursor, qb.service.Ctx)
+
+	var result struct {
+		Avg interface{} `bson:"avg"`
+	}
+
+	if cursor.Next(qb.service.Ctx) {
+		if err := cursor.Decode(&result); err != nil {
+			return nil, err
+		}
+		return result.Avg, nil
+	}
+
+	return 0, nil
+}
+
+func (qb *MongoQueryBuilder[T]) Exists() (bool, error) {
+	count, err := qb.Count()
+	return count > 0, err
+}
+
+func (qb *MongoQueryBuilder[T]) DoesntExist() (bool, error) {
+	exists, err := qb.Exists()
+	return !exists, err
+}
+
+// ========================
+// Pagination (Laravel-style)
+// ========================
+type PaginationResult[T GlobalModels.ORMModel] struct {
+	Data        []T   `json:"data"`
+	CurrentPage int   `json:"current_page"`
+	LastPage    int   `json:"last_page"`
+	PerPage     int   `json:"per_page"`
+	Total       int64 `json:"total"`
+	From        int   `json:"from"`
+	To          int   `json:"to"`
+}
+
+func (qb *MongoQueryBuilder[T]) Paginate(page, perPage int) (*PaginationResult[T], error) {
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 15
+	}
+
+	// Get total count
+	total, err := qb.Count()
+	if err != nil {
+		return nil, err
+	}
+
+	// Calculate pagination
+	skip := (page - 1) * perPage
+	lastPage := int((total + int64(perPage) - 1) / int64(perPage))
+
+	// Get paginated results
+	results, err := qb.Skip(skip).Take(perPage).Get()
+	if err != nil {
+		return nil, err
+	}
+
+	from := skip + 1
+	to := skip + len(results)
+	if total == 0 {
+		from = 0
+	}
+
+	return &PaginationResult[T]{
+		Data:        results,
+		CurrentPage: page,
+		LastPage:    lastPage,
+		PerPage:     perPage,
+		Total:       total,
+		From:        from,
+		To:          to,
+	}, nil
+}
+
+func (qb *MongoQueryBuilder[T]) SimplePaginate(page, perPage int) ([]T, error) {
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 15
+	}
+
+	skip := (page - 1) * perPage
+	return qb.Skip(skip).Take(perPage + 1).Get() // +1 to check if there are more records
+}
+
+// ========================
+// Chunking (Laravel-style)
+// ========================
+func (qb *MongoQueryBuilder[T]) Chunk(size int, callback func([]T) error) error {
+	if size <= 0 {
+		return errors.New("chunk size must be greater than 0")
+	}
+
+	skip := 0
+	for {
+		results, err := qb.Skip(skip).Take(size).Get()
+		if err != nil {
+			return err
+		}
+
+		if len(results) == 0 {
+			break
+		}
+
+		if err := callback(results); err != nil {
+			return err
+		}
+
+		if len(results) < size {
+			break
+		}
+
+		skip += size
+	}
+
+	return nil
+}
+
+func (qb *MongoQueryBuilder[T]) Each(callback func(T) error) error {
+	return qb.Chunk(1000, func(models []T) error {
+		for _, model := range models {
+			if err := callback(model); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ========================
+// Updates and Deletes (Laravel-style)
+// ========================
+func (qb *MongoQueryBuilder[T]) Update(values bson.M) (int64, error) {
+	if len(qb.filter) == 0 && !qb.withTrashed && !qb.onlyTrashed {
+		return 0, errors.New("update requires filter for safety")
+	}
+
+	// Add updated_at timestamp
+	model := qb.service.Factory()
+	if model.IsTimestamps() {
+		values[model.GetUpdatedAtColumn()] = time.Now()
+	}
+
+	// Filter attributes
+	filteredValues := qb.service.filterAttributes(values)
+
+	updateDoc := bson.M{"$set": filteredValues}
+	result, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, updateDoc)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.ModifiedCount, nil
+}
+
+func (qb *MongoQueryBuilder[T]) Increment(field string, amount ...int) (int64, error) {
+	value := 1
+	if len(amount) > 0 {
+		value = amount[0]
+	}
+
+	updateDoc := bson.M{"$inc": bson.M{field: value}}
+
+	// Add updated_at timestamp
+	model := qb.service.Factory()
+	if model.IsTimestamps() {
+		updateDoc["$set"] = bson.M{model.GetUpdatedAtColumn(): time.Now()}
+	}
+
+	result, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, updateDoc)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.ModifiedCount, nil
+}
+
+func (qb *MongoQueryBuilder[T]) Decrement(field string, amount ...int) (int64, error) {
+	value := 1
+	if len(amount) > 0 {
+		value = amount[0]
+	}
+
+	updateDoc := bson.M{"$inc": bson.M{field: -value}}
+
+	// Add updated_at timestamp
+	model := qb.service.Factory()
+	if model.IsTimestamps() {
+		updateDoc["$set"] = bson.M{model.GetUpdatedAtColumn(): time.Now()}
+	}
+
+	result, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, updateDoc)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.ModifiedCount, nil
+}
+
+func (qb *MongoQueryBuilder[T]) Delete() (int64, error) {
+	if len(qb.filter) == 0 && !qb.withTrashed && !qb.onlyTrashed {
+		return 0, errors.New("delete requires filter for safety")
+	}
+
+	model := qb.service.Factory()
+
+	// Soft delete if enabled
+	if model.IsSoftDeletes() && !qb.forceDelete {
+		updates := bson.M{
+			model.GetDeletedAtColumn(): time.Now(),
+		}
+		return qb.Update(updates)
+	}
+
+	// Hard delete
+	result, err := qb.service.Collection.DeleteMany(qb.service.Ctx, qb.filter)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.DeletedCount, nil
+}
+
+func (qb *MongoQueryBuilder[T]) ForceDelete() (int64, error) {
+	qb.forceDelete = true
+	return qb.Delete()
+}
+
+func (qb *MongoQueryBuilder[T]) Restore() (int64, error) {
+	model := qb.service.Factory()
+	if !model.IsSoftDeletes() {
+		return 0, errors.New("model does not support soft deletes")
+	}
+
+	updateDoc := bson.M{"$unset": bson.M{model.GetDeletedAtColumn(): ""}}
+	result, err := qb.service.Collection.UpdateMany(qb.service.Ctx, qb.filter, updateDoc)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.ModifiedCount, nil
+}
+
+// ========================
+// Eloquent Model Methods (Laravel-style)
+// ========================
+func (s *BaseEloquentService[T]) All(fields ...string) ([]T, error) {
+	qb := s.NewQuery()
+	if len(fields) > 0 {
+		qb = qb.Select(fields...)
+	}
+	return qb.Get()
+}
+
+func (s *BaseEloquentService[T]) Find(id interface{}, fields ...string) (T, error) {
+	qb := s.NewQuery()
+	if len(fields) > 0 {
+		qb = qb.Select(fields...)
+	}
+	return qb.Find(id)
+}
+
+func (s *BaseEloquentService[T]) FindOrFail(id interface{}, fields ...string) (T, error) {
+	qb := s.NewQuery()
+	if len(fields) > 0 {
+		qb = qb.Select(fields...)
+	}
+	return qb.FindOrFail(id)
+}
+
+func (s *BaseEloquentService[T]) FindMany(ids []interface{}, fields ...string) ([]T, error) {
+	qb := s.NewQuery().WhereIn("_id", ids)
+	if len(fields) > 0 {
+		qb = qb.Select(fields...)
+	}
+	return qb.Get()
+}
+
+func (s *BaseEloquentService[T]) First(fields ...string) (T, error) {
+	qb := s.NewQuery()
+	if len(fields) > 0 {
+		qb = qb.Select(fields...)
+	}
+	return qb.First()
+}
+
+func (s *BaseEloquentService[T]) FirstOrFail(fields ...string) (T, error) {
+	qb := s.NewQuery()
+	if len(fields) > 0 {
+		qb = qb.Select(fields...)
+	}
+	return qb.FirstOrFail()
+}
+
+func (s *BaseEloquentService[T]) FirstOrCreate(attributes bson.M, values ...bson.M) (T, error) {
+	qb := s.NewQuery()
+	for key, value := range attributes {
+		qb = qb.Where(key, value)
+	}
+
+	model, err := qb.First()
+	if err == nil {
+		return model, nil
+	}
+
+	// Create new model
+	createData := make(bson.M)
+	for k, v := range attributes {
+		createData[k] = v
+	}
+
+	if len(values) > 0 {
+		for k, v := range values[0] {
+			createData[k] = v
+		}
+	}
+
+	return s.Create(createData)
+}
+
+func (s *BaseEloquentService[T]) FirstOrNew(attributes bson.M, values ...bson.M) (T, bool, error) {
+	qb := s.NewQuery()
+	for key, value := range attributes {
+		qb = qb.Where(key, value)
+	}
+
+	model, err := qb.First()
+	if err == nil {
+		return model, false, nil // Found existing
+	}
+
+	// Create new instance (not saved)
+	newModel := s.Factory()
+	createData := make(bson.M)
+	for k, v := range attributes {
+		createData[k] = v
+	}
+
+	if len(values) > 0 {
+		for k, v := range values[0] {
+			createData[k] = v
+		}
+	}
+
+	err = s.FromMap(&newModel, createData)
+	return newModel, true, err // New instance
+}
+
+func (s *BaseEloquentService[T]) UpdateOrCreate(attributes bson.M, values bson.M) (T, error) {
+	qb := s.NewQuery()
+	for key, value := range attributes {
+		qb = qb.Where(key, value)
+	}
+
+	model, err := qb.First()
+	if err == nil {
+		// Update existing
+		modelMap, _ := s.ToMap(model)
+		id := modelMap["_id"]
+		_, updateErr := s.NewQuery().Where("_id", id).Update(values)
+		if updateErr != nil {
+			return model, updateErr
+		}
+		// Reload model
+		return s.Find(id)
+	}
+
+	// Create new
+	createData := make(bson.M)
+	for k, v := range attributes {
+		createData[k] = v
+	}
+	for k, v := range values {
+		createData[k] = v
+	}
+
+	return s.Create(createData)
+}
+
+// ========================
+// Create, Update, Save (Laravel-style)
+// ========================
+func (s *BaseEloquentService[T]) Create(attributes bson.M) (T, error) {
+	model := s.Factory()
+
+	// Add timestamps
+	if model.IsTimestamps() {
+		now := time.Now()
+		attributes[model.GetCreatedAtColumn()] = now
+		attributes[model.GetUpdatedAtColumn()] = now
+	}
+
+	// Execute Creating hook
+	if s.Creating != nil {
+		if err := s.Creating(model); err != nil {
 			return model, err
 		}
 	}
-	model.SetTimestampsOnCreate()
-	res, err := s.Collection.InsertOne(s.Ctx, model)
+
+	// Execute Saving hook
+	if s.Saving != nil {
+		if err := s.Saving(model); err != nil {
+			return model, err
+		}
+	}
+
+	// Filter fillable/guarded attributes
+	filteredAttrs := s.filterAttributes(attributes)
+
+	// Insert document
+	result, err := s.Collection.InsertOne(s.Ctx, filteredAttrs)
 	if err != nil {
 		return model, err
 	}
-	if oid, ok := res.InsertedID.(primitive.ObjectID); ok {
-		model.SetID(oid)
+
+	// Add the generated ID
+	if oid, ok := result.InsertedID.(primitive.ObjectID); ok {
+		filteredAttrs["_id"] = oid
 	}
-	if s.AfterCreate != nil {
-		_ = s.AfterCreate(model)
+
+	// Hydrate model
+	if err := s.FromMap(&model, filteredAttrs); err != nil {
+		return model, err
 	}
+
+	// Execute Created hook
+	if s.Created != nil {
+		if err := s.Created(model); err != nil {
+			return model, err
+		}
+	}
+
+	// Execute Saved hook
+	if s.Saved != nil {
+		if err := s.Saved(model); err != nil {
+			return model, err
+		}
+	}
+
 	return model, nil
 }
 
-// Update by ID with AfterUpdate hook
-func (s *BaseService[T]) Update(id string, updates bson.M) error {
-	objID, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		return err
-	}
-	updates["updated_at"] = time.Now()
-	currentModel, err := s.Find(id)
-	if err != nil {
-		return err
-	}
-	updates["created_at"] = currentModel.GetCreatedAt()
-	updates["deleted_at"] = currentModel.GetDeletedAt()
-
-	model := s.Factory()
-	err = s.FromBson(&model, updates)
-	if err != nil {
-		return err
-	}
-
-	updates, err = s.ToBson(model)
-	if err != nil {
-		return err
-	}
-
-	if s.BeforeSave != nil {
-		// Optional: fetch model, apply updates and call BeforeSave here
-		err = s.BeforeSave(model)
-		if err != nil {
-			return err
-		}
-	}
-	_, err = s.Collection.UpdateOne(s.Ctx, bson.M{"_id": objID}, bson.M{"$set": updates})
-	if err == nil && s.AfterUpdate != nil {
-		model, findErr := s.Find(id)
-		if findErr == nil {
-			_ = s.AfterUpdate(model)
-		}
-	}
-	return err
-}
-
-// Delete (soft delete) with lifecycle hooks
-func (s *BaseService[T]) Delete(id string) error {
-	if s.BeforeDelete != nil {
-		if err := s.BeforeDelete(id); err != nil {
-			return err
-		}
-	}
-	objID, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		return err
-	}
-	_, err = s.Collection.UpdateOne(s.Ctx, bson.M{"_id": objID}, bson.M{"$set": bson.M{"deleted_at": time.Now()}})
-	if err == nil && s.AfterDelete != nil {
-		_ = s.AfterDelete(id)
-	}
-	return err
-}
-
-// Restore a soft deleted document
-func (s *BaseService[T]) Restore(id string) error {
-	objID, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		return err
-	}
-	_, err = s.Collection.UpdateOne(s.Ctx, bson.M{"_id": objID}, bson.M{"$set": bson.M{"deleted_at": time.Time{}}})
-	return err
-}
-
-// ForceDelete hard deletes a document by ID
-func (s *BaseService[T]) ForceDelete(id string) error {
-	if s.BeforeDelete != nil {
-		if err := s.BeforeDelete(id); err != nil {
-			return err
-		}
-	}
-	objID, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		return err
-	}
-	_, err = s.Collection.DeleteOne(s.Ctx, bson.M{"_id": objID})
-	if err == nil && s.AfterDelete != nil {
-		_ = s.AfterDelete(id)
-	}
-	return err
-}
-
-// UpdateOrCreate updates by id or creates if not found
-func (s *BaseService[T]) UpdateOrCreate(id string, updates bson.M) (T, error) {
-	var model T
-	model = s.Factory()
-
-	objID, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		// Invalid ID — treat as create
-		_ = s.FromBson(&model, updates)
-		return s.Save(model)
-	}
-
-	// Try update
-	updates["updated_at"] = time.Now()
-	result, err := s.Collection.UpdateOne(s.Ctx, bson.M{"_id": objID}, bson.M{"$set": updates})
+func (s *BaseEloquentService[T]) Save(model T) (T, error) {
+	modelMap, err := s.ToMap(model)
 	if err != nil {
 		return model, err
 	}
 
-	if result.MatchedCount == 0 {
-		// No document found — create new
-		_ = s.FromBson(&model, updates)
-		model.SetID(objID) // if you have this method
-		return s.Save(model)
+	// Check if model exists (has _id)
+	if id, exists := modelMap["_id"]; exists && id != nil {
+		// Update existing
+		delete(modelMap, "_id") // Don't update ID
+
+		if model.IsTimestamps() {
+			modelMap[model.GetUpdatedAtColumn()] = time.Now()
+		}
+
+		// Execute Updating hook
+		if s.Updating != nil {
+			if err := s.Updating(model); err != nil {
+				return model, err
+			}
+		}
+
+		// Execute Saving hook
+		if s.Saving != nil {
+			if err := s.Saving(model); err != nil {
+				return model, err
+			}
+		}
+
+		filteredAttrs := s.filterAttributes(modelMap)
+		_, err := s.NewQuery().Where("_id", id).Update(filteredAttrs)
+		if err != nil {
+			return model, err
+		}
+
+		// Execute Updated hook
+		if s.Updated != nil {
+			if err := s.Updated(model); err != nil {
+				return model, err
+			}
+		}
+
+		// Execute Saved hook
+		if s.Saved != nil {
+			if err := s.Saved(model); err != nil {
+				return model, err
+			}
+		}
+
+		// Reload model
+		return s.Find(id)
+	} else {
+		// Create new
+		return s.Create(modelMap)
+	}
+}
+
+func (s *BaseEloquentService[T]) Destroy(ids ...interface{}) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
 	}
 
-	// Updated — fetch latest
+	var totalDeleted int64
+
+	for _, id := range ids {
+		// Execute Deleting hook
+		model, err := s.Find(id)
+		if err != nil {
+			continue
+		}
+
+		if s.Deleting != nil {
+			if err := s.Deleting(model); err != nil {
+				continue
+			}
+		}
+
+		deleted, err := s.NewQuery().Where("_id", id).Delete()
+		if err != nil {
+			continue
+		}
+
+		totalDeleted += deleted
+
+		// Execute Deleted hook
+		if s.Deleted != nil {
+			if err := s.Deleted(model); err != nil {
+				continue
+			}
+		}
+	}
+
+	return totalDeleted, nil
+}
+
+// ========================
+// Helper Methods
+// ========================
+func (s *BaseEloquentService[T]) filterAttributes(attributes bson.M) bson.M {
+	model := s.Factory()
+	fillable := model.GetFillable()
+	guarded := model.GetGuarded()
+
+	filtered := make(bson.M)
+
+	for key, value := range attributes {
+		// Check guarded first
+		if len(guarded) > 0 {
+			isGuarded := false
+			for _, guardedField := range guarded {
+				if guardedField == key || guardedField == "*" {
+					isGuarded = true
+					break
+				}
+			}
+			if isGuarded {
+				continue
+			}
+		}
+
+		// Check fillable
+		if len(fillable) > 0 {
+			isFillable := false
+			for _, fillableField := range fillable {
+				if fillableField == key || fillableField == "*" {
+					isFillable = true
+					break
+				}
+			}
+			if !isFillable {
+				continue
+			}
+		}
+
+		filtered[key] = value
+	}
+
+	return filtered
+}
+
+// ========================
+// Global Scopes
+// ========================
+func (s *BaseEloquentService[T]) AddGlobalScope(name string, scope func(*MongoQueryBuilder[T]) *MongoQueryBuilder[T]) {
+	s.GlobalScopes[name] = scope
+}
+
+func (s *BaseEloquentService[T]) WithoutGlobalScope(name string) *MongoQueryBuilder[T] {
+	qb := &MongoQueryBuilder[T]{
+		service:    s,
+		filter:     bson.M{},
+		sort:       bson.D{},
+		limit:      0,
+		skip:       0,
+		projection: bson.M{},
+		scopes:     []string{},
+	}
+
+	// Apply all global scopes except the specified one
+	for scopeName, scope := range s.GlobalScopes {
+		if scopeName != name {
+			qb.scopes = append(qb.scopes, scopeName)
+			qb = scope(qb)
+		}
+	}
+
+	return qb
+}
+
+func (s *BaseEloquentService[T]) WithoutGlobalScopes(names ...string) *MongoQueryBuilder[T] {
+	qb := &MongoQueryBuilder[T]{
+		service:    s,
+		filter:     bson.M{},
+		sort:       bson.D{},
+		limit:      0,
+		skip:       0,
+		projection: bson.M{},
+		scopes:     []string{},
+	}
+
+	// Create map of excluded scopes
+	excluded := make(map[string]bool)
+	for _, name := range names {
+		excluded[name] = true
+	}
+
+	// Apply global scopes except excluded ones
+	for scopeName, scope := range s.GlobalScopes {
+		if !excluded[scopeName] {
+			qb.scopes = append(qb.scopes, scopeName)
+			qb = scope(qb)
+		}
+	}
+
+	return qb
+}
+
+// ========================
+// Utility Methods
+// ========================
+func (s *BaseEloquentService[T]) ToMap(model T) (bson.M, error) {
+	b, err := json.Marshal(model)
+	if err != nil {
+		return nil, err
+	}
+	var m bson.M
+	err = json.Unmarshal(b, &m)
+	return m, err
+}
+
+func (s *BaseEloquentService[T]) FromMap(model *T, data bson.M) error {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, model)
+}
+
+func (s *BaseEloquentService[T]) Fresh(model T) (T, error) {
+	modelMap, err := s.ToMap(model)
+	if err != nil {
+		return model, err
+	}
+
+	id, exists := modelMap["_id"]
+	if !exists || id == nil {
+		return model, errors.New("model has no ID")
+	}
+
 	return s.Find(id)
 }
 
-// CreateOrUpdate creates or updates a model
-func (s *BaseService[T]) CreateOrUpdate(model T) (T, error) {
-	doc, err := s.ToBson(model)
+func (s *BaseEloquentService[T]) Refresh(model *T) error {
+	fresh, err := s.Fresh(*model)
 	if err != nil {
-		return model, err
+		return err
 	}
-	return s.UpdateOrCreate(model.GetID().Hex(), doc)
+	*model = fresh
+	return nil
 }
 
-// FirstOrCreate finds or creates a record
-func (s *BaseService[T]) FirstOrCreate(filter bson.M, newData T) (T, error) {
-	obj := s.Factory()
-	if s.BeforeFetch != nil {
-		if err := s.BeforeFetch(obj); err != nil {
-			return obj, err
-		}
+// ========================
+// Collection-style Methods
+// ========================
+func (s *BaseEloquentService[T]) Pluck(field string, key ...string) (map[interface{}]interface{}, error) {
+	var selectFields []string
+	if len(key) > 0 {
+		selectFields = []string{key[0], field}
+	} else {
+		selectFields = []string{field}
 	}
-	err := s.Collection.FindOne(s.Ctx, filter).Decode(obj)
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		return s.Save(newData)
-	} else if err != nil {
-		var zero T
-		return zero, err
-	}
-	if s.AfterFetch != nil {
-		if err := s.AfterFetch(obj); err != nil {
-			return obj, err
-		}
-	}
-	return obj, nil
-}
 
-// Reload reloads model from DB
-func (s *BaseService[T]) Reload(model T) (T, error) {
-	return s.Find(model.GetID().Hex())
-}
-
-// findOne helper
-func (s *BaseService[T]) findOne(filter bson.M) (T, error) {
-	var zero T
-	obj := s.Factory()
-	if s.BeforeFetch != nil {
-		if err := s.BeforeFetch(obj); err != nil {
-			return zero, err
-		}
-	}
-	err := s.Collection.FindOne(s.Ctx, filter).Decode(obj)
-
-	if s.AfterFetch != nil {
-		if err := s.AfterFetch(obj); err != nil {
-			return zero, err
-		}
-	}
+	results, err := s.NewQuery().Select(selectFields...).Get()
 	if err != nil {
-		return zero, err
+		return nil, err
 	}
-	return obj, nil
+
+	plucked := make(map[interface{}]interface{})
+
+	for i, result := range results {
+		resultMap, err := s.ToMap(result)
+		if err != nil {
+			continue
+		}
+
+		value := resultMap[field]
+
+		if len(key) > 0 {
+			keyValue := resultMap[key[0]]
+			plucked[keyValue] = value
+		} else {
+			plucked[i] = value
+		}
+	}
+
+	return plucked, nil
 }
 
-// findWithFilter helper
-func (s *BaseService[T]) findWithFilter(filter bson.M) ([]T, error) {
-	cursor, err := s.Collection.Find(s.Ctx, filter)
+// ========================
+// MongoDB-specific Methods
+// ========================
+
+// Aggregation pipeline support
+func (qb *MongoQueryBuilder[T]) Aggregate(pipeline []bson.M) ([]bson.M, error) {
+	cursor, err := qb.service.Collection.Aggregate(qb.service.Ctx, pipeline)
 	if err != nil {
 		return nil, err
 	}
 	defer func(cursor *mongo.Cursor, ctx context.Context) {
 		err := cursor.Close(ctx)
 		if err != nil {
-			return
-		}
-	}(cursor, s.Ctx)
 
-	var results []T
-	for cursor.Next(s.Ctx) {
-		obj := s.Factory()
-		if s.BeforeFetch != nil {
-			if err := s.BeforeFetch(obj); err != nil {
-				continue
-			}
 		}
-		if err := cursor.Decode(obj); err == nil {
-			if s.AfterFetch != nil {
-				if err := s.AfterFetch(obj); err != nil {
-					continue
-				}
-			}
-			results = append(results, obj)
-		}
+	}(cursor, qb.service.Ctx)
+
+	var results []bson.M
+	if err = cursor.All(qb.service.Ctx, &results); err != nil {
+		return nil, err
 	}
+
 	return results, nil
 }
 
-// paginate helper used by MongoQueryBuilder.Paginate
-func (s *BaseService[T]) paginate(filter bson.M, page, limit int) ([]T, int64, error) {
-	skip := (page - 1) * limit
-	total, err := s.Collection.CountDocuments(s.Ctx, filter)
-	if err != nil {
-		return nil, 0, err
+// Text search support
+func (qb *MongoQueryBuilder[T]) WhereText(searchTerm string) *MongoQueryBuilder[T] {
+	qb.filter["$text"] = bson.M{"$search": searchTerm}
+	return qb
+}
+
+// Geospatial queries
+func (qb *MongoQueryBuilder[T]) WhereNear(field string, lng, lat float64, maxDistance ...float64) *MongoQueryBuilder[T] {
+	near := bson.M{
+		"$geometry": bson.M{
+			"type":        "Point",
+			"coordinates": []float64{lng, lat},
+		},
 	}
 
-	cursor, err := s.Collection.Find(s.Ctx, filter, options.Find().SetSkip(int64(skip)).SetLimit(int64(limit)))
+	if len(maxDistance) > 0 {
+		near["$maxDistance"] = maxDistance[0]
+	}
+
+	qb.filter[field] = bson.M{"$near": near}
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereGeoWithin(field string, geometry bson.M) *MongoQueryBuilder[T] {
+	qb.filter[field] = bson.M{"$geoWithin": geometry}
+	return qb
+}
+
+// Array operations
+func (qb *MongoQueryBuilder[T]) WhereArrayContains(field string, value interface{}) *MongoQueryBuilder[T] {
+	qb.filter[field] = value
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereArraySize(field string, size int) *MongoQueryBuilder[T] {
+	qb.filter[field] = bson.M{"$size": size}
+	return qb
+}
+
+func (qb *MongoQueryBuilder[T]) WhereElemMatch(field string, condition bson.M) *MongoQueryBuilder[T] {
+	qb.filter[field] = bson.M{"$elemMatch": condition}
+	return qb
+}
+
+// Regex queries
+func (qb *MongoQueryBuilder[T]) WhereRegex(field string, pattern string, options ...string) *MongoQueryBuilder[T] {
+	regex := bson.M{"$regex": pattern}
+	if len(options) > 0 {
+		regex["$options"] = options[0]
+	}
+	qb.filter[field] = regex
+	return qb
+}
+
+// Type checking
+func (qb *MongoQueryBuilder[T]) WhereType(field string, bsonType interface{}) *MongoQueryBuilder[T] {
+	qb.filter[field] = bson.M{"$type": bsonType}
+	return qb
+}
+
+// Modulo operation
+func (qb *MongoQueryBuilder[T]) WhereMod(field string, divisor, remainder int) *MongoQueryBuilder[T] {
+	qb.filter[field] = bson.M{"$mod": []int{divisor, remainder}}
+	return qb
+}
+
+// JSON path queries (for nested documents)
+func (qb *MongoQueryBuilder[T]) WhereJsonContains(field string, path string, value interface{}) *MongoQueryBuilder[T] {
+	qb.filter[field+"."+path] = value
+	return qb
+}
+
+// Bulk operations
+func (s *BaseEloquentService[T]) BulkWrite(operations []mongo.WriteModel) (*mongo.BulkWriteResult, error) {
+	return s.Collection.BulkWrite(s.Ctx, operations)
+}
+
+// Index operations
+func (s *BaseEloquentService[T]) CreateIndex(keys bson.D, options ...*options.IndexOptions) (string, error) {
+	indexModel := mongo.IndexModel{Keys: keys}
+	if len(options) > 0 {
+		indexModel.Options = options[0]
+	}
+	return s.Collection.Indexes().CreateOne(s.Ctx, indexModel)
+}
+
+func (s *BaseEloquentService[T]) CreateIndexes(indexes []mongo.IndexModel) ([]string, error) {
+	return s.Collection.Indexes().CreateMany(s.Ctx, indexes)
+}
+
+func (s *BaseEloquentService[T]) DropIndex(name string) error {
+	_, err := s.Collection.Indexes().DropOne(s.Ctx, name)
+	return err
+}
+
+func (s *BaseEloquentService[T]) ListIndexes() ([]bson.M, error) {
+	cursor, err := s.Collection.Indexes().List(s.Ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	defer func(cursor *mongo.Cursor, ctx context.Context) {
 		err := cursor.Close(ctx)
 		if err != nil {
-			return
+
 		}
 	}(cursor, s.Ctx)
 
-	var results []T
-	for cursor.Next(s.Ctx) {
-		obj := s.Factory()
-		if s.BeforeFetch != nil {
-			if err := s.BeforeFetch(obj); err != nil {
-				continue
-			}
-		}
-		if err := cursor.Decode(obj); err == nil {
-			if s.AfterFetch != nil {
-				if err := s.AfterFetch(obj); err != nil {
-					continue
-				}
-			}
-			results = append(results, obj)
-		}
-	}
-	return results, total, nil
-}
-
-// NewInstance returns a new instance of the service
-func (s *BaseService[T]) NewInstance() BaseService[T] {
-	return *s
-}
-
-// GetCollection returns the collection
-func (s *BaseService[T]) GetCollection() *mongo.Collection {
-	return s.Collection
-}
-
-// GetModel returns the model factory
-func (s *BaseService[T]) GetModel() T {
-	return s.Factory()
-}
-
-// NewModel returns a new instance of the model
-func (s *BaseService[T]) NewModel() T {
-	return s.Factory()
-}
-
-// GetFactory returns the model factory
-func (s *BaseService[T]) GetFactory() func() T {
-	return s.Factory
-}
-
-func (s *BaseService[T]) GetCtx() context.Context {
-	return s.Ctx
-}
-
-func (s *BaseService[T]) GetCollectionName() string {
-	return s.CollectionName
-}
-
-func (s *BaseService[T]) GetRoutePrefix() string {
-	t := reflect.TypeOf(s.GetFactory()())
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	hyphenated := StringLibs.Hyphenate(t.Name())
-	return StringLibs.Pluralize(strings.ToLower(hyphenated))
-}
-
-// ToBson converts a model instance to bson.M by marshalling/unmarshalling inside the service.
-func (s *BaseService[T]) ToBson(model T) (bson.M, error) {
-	data, err := bson.Marshal(model)
-	if err != nil {
+	var indexes []bson.M
+	if err = cursor.All(s.Ctx, &indexes); err != nil {
 		return nil, err
 	}
-	var doc bson.M
-	err = bson.Unmarshal(data, &doc)
-	return doc, err
-}
 
-// ToJson converts a model instance to map[string]interface{} by marshalling/unmarshalling inside the service.
-func (s *BaseService[T]) ToJson(model T) (map[string]interface{}, error) {
-	bytes, err := json.Marshal(model)
-	if err != nil {
-		return nil, err
-	}
-	var result map[string]interface{}
-	err = json.Unmarshal(bytes, &result)
-	return result, err
-}
-
-// FromBson converts a bson.M document to the model instance
-func (s *BaseService[T]) FromBson(model *T, data bson.M) error {
-	bytes, err := bson.Marshal(data)
-	if err != nil {
-		return err
-	}
-	return bson.Unmarshal(bytes, model)
-}
-
-// FromJson converts a JSON-like map to the model instance
-// FromJson converts a JSON-like map to the model instance (must be pointer)
-func (s *BaseService[T]) FromJson(model *T, data map[string]interface{}) error {
-	bytes, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(bytes, model)
+	return indexes, nil
 }
