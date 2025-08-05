@@ -21,6 +21,18 @@ type ORMModel interface {
 	GetUpdatedAt() time.Time
 	GetDeletedAt() time.Time
 	GetStatus() string
+
+	GetTable() string
+	GetFillable() []string
+	GetGuarded() []string
+	GetHidden() []string
+	GetCasts() map[string]string
+	GetDates() []string
+	IsTimestamps() bool
+	IsSoftDeletes() bool
+	GetCreatedAtColumn() string
+	GetUpdatedAtColumn() string
+	GetDeletedAtColumn() string
 }
 
 // GetID returns the ObjectID of the model.
@@ -55,4 +67,53 @@ func (b *BaseModel) GetDeletedAt() time.Time {
 
 func (b *BaseModel) GetStatus() string {
 	return b.Status
+}
+
+// EloquentModel implementation for BaseModel (default values, override in child models as needed)
+func (b *BaseModel) GetTable() string {
+	return ""
+}
+
+func (b *BaseModel) GetFillable() []string {
+	return []string{"status"}
+}
+
+func (b *BaseModel) GetGuarded() []string {
+	return []string{"id"}
+}
+
+func (b *BaseModel) GetHidden() []string {
+	return []string{}
+}
+
+func (b *BaseModel) GetCasts() map[string]string {
+	return map[string]string{
+		"created_at": "time.Time",
+		"updated_at": "time.Time",
+		"deleted_at": "time.Time",
+	}
+}
+
+func (b *BaseModel) GetDates() []string {
+	return []string{"created_at", "updated_at", "deleted_at"}
+}
+
+func (b *BaseModel) IsTimestamps() bool {
+	return true
+}
+
+func (b *BaseModel) IsSoftDeletes() bool {
+	return true
+}
+
+func (b *BaseModel) GetCreatedAtColumn() string {
+	return "created_at"
+}
+
+func (b *BaseModel) GetUpdatedAtColumn() string {
+	return "updated_at"
+}
+
+func (b *BaseModel) GetDeletedAtColumn() string {
+	return "deleted_at"
 }
