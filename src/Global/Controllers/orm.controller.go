@@ -2,8 +2,8 @@ package Controllers
 
 import (
 	"github.com/gin-gonic/gin"
+	GlobalModels "github.com/venomous-maker/go-eloquent/src/Global/Models"
 	GlobalRoutes "github.com/venomous-maker/go-eloquent/src/Global/Routes"
-	MongoModels "github.com/venomous-maker/go-eloquent/src/Mongo/ORM/Models"
 	MongoServices "github.com/venomous-maker/go-eloquent/src/Mongo/ORM/Services"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"net/http"
@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-type BaseController[T MongoModels.MongoModel] struct {
+type BaseController[T GlobalModels.ORMModel] struct {
 	Service     MongoServices.BaseServiceInterface[T]
 	ExtraRoutes []GlobalRoutes.ExtraRoute
 }
