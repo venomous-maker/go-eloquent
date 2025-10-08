@@ -11,8 +11,6 @@ import (
 // BaseModel is a base model for all models in the application.
 // It implements the MongoModel interface.
 // It provides a set of zero-value lifecycle hooks and an empty map of global scopes.
-// It also has a context, a MongoDB database, a factory function, and a collection
-// name.
 type BaseModel struct {
 	ID        primitive.ObjectID `json:"id" bson:"_id,omitempty"`
 	CreatedAt time.Time          `json:"created_at" bson:"created_at"`
@@ -75,6 +73,15 @@ func (b *BaseModel) GetStatus() string {
 	return b.Status
 }
 
+// GetCollectionName returns the name of the MongoDB collection associated with the model.
+//
+// It uses reflection to find the name of the struct that embeds BaseModel.
+// If the BaseModel is embedded, it will attempt to find the parent struct and use that instead.
+//
+// Parameters: None
+//
+// Returns:
+// The name of the MongoDB collection associated with the model.
 func (b *BaseModel) GetCollectionName() string {
 	// Use reflection to get the name of the struct that embeds BaseModel
 	t := reflect.TypeOf(b)
