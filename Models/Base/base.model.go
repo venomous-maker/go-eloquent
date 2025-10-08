@@ -8,6 +8,11 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
+// BaseModel is a base model for all models in the application.
+// It implements the MongoModel interface.
+// It provides a set of zero-value lifecycle hooks and an empty map of global scopes.
+// It also has a context, a MongoDB database, a factory function, and a collection
+// name.
 type BaseModel struct {
 	ID        primitive.ObjectID `json:"id" bson:"_id,omitempty"`
 	CreatedAt time.Time          `json:"created_at" bson:"created_at"`
@@ -25,6 +30,7 @@ type MongoModel interface {
 	GetDeletedAt() time.Time
 	GetStatus() string
 	GetCollectionName() string
+	GetTableName() string
 }
 
 func (b *BaseModel) GetID() primitive.ObjectID {
@@ -92,4 +98,18 @@ func (b *BaseModel) GetCollectionName() string {
 
 	// Fallback
 	return StringLibs.Pluralize(StringLibs.ConvertToSnakeCase(t.Name()))
+}
+
+// GetTableName returns the name of the MongoDB collection associated with the model.
+//
+// It is a part of the MongoModel interface.
+//
+// It simply calls GetCollectionName() and returns the result.
+//
+// Parameters: None
+//
+// Returns:
+// The name of the MongoDB collection associated with the model.
+func (b *BaseModel) GetTableName() string {
+	return b.GetCollectionName()
 }
