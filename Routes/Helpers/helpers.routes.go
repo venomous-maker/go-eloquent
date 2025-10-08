@@ -1,4 +1,4 @@
-package EloquentRouteHelpers
+package base
 
 import "github.com/gin-gonic/gin"
 

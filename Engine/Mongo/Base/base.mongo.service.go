@@ -1,4 +1,4 @@
-package ORMServices
+package base
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"time"
 
 	BaseModels "github.com/venomous-maker/go-eloquent/Models/Base"
-	StringLibs "github.com/venomous-maker/go-eloquent/src/Libs/Strings"
+	strlib "github.com/venomous-maker/go-eloquent/libs/strings"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -38,7 +38,7 @@ func resolveRelatedCollection(raw string) string {
 		return raw
 	}
 	// derive from model token
-	return StringLibs.Pluralize(StringLibs.ConvertToSnakeCase(raw))
+	return strlib.Pluralize(strlib.ConvertToSnakeCase(raw))
 }
 
 // Eloquent is the main query builder struct similar to Laravel's Eloquent
@@ -389,14 +389,14 @@ func (e *Eloquent[T]) inferRelation(name string) Relation {
 		relation.Type = BelongsTo
 		relation.ForeignKey = name
 		relation.LocalKey = "_id"
-	} else if StringLibs.ConvertToSnakeCase(name) == strings.ToLower(modelName) {
+	} else if strlib.ConvertToSnakeCase(name) == strings.ToLower(modelName) {
 		relation.Type = HasMany
-		relation.ForeignKey = StringLibs.ConvertToSnakeCase(modelName) + "_id"
+		relation.ForeignKey = strlib.ConvertToSnakeCase(modelName) + "_id"
 		relation.LocalKey = "_id"
 	} else {
 		// Default to hasMany
 		relation.Type = HasMany
-		relation.ForeignKey = StringLibs.ConvertToSnakeCase(modelName) + "_id"
+		relation.ForeignKey = strlib.ConvertToSnakeCase(modelName) + "_id"
 		relation.LocalKey = "_id"
 	}
 
@@ -417,7 +417,7 @@ func (e *Eloquent[T]) getModelName() string {
 // BelongsTo defines a belongs-to relationship
 func (e *Eloquent[T]) BelongsTo(related, foreignKey, localKey string) *Eloquent[T] {
 	if foreignKey == "" {
-		foreignKey = StringLibs.ConvertToSnakeCase(related) + "_id"
+		foreignKey = strlib.ConvertToSnakeCase(related) + "_id"
 	}
 	if localKey == "" {
 		localKey = "_id"
@@ -436,7 +436,7 @@ func (e *Eloquent[T]) BelongsTo(related, foreignKey, localKey string) *Eloquent[
 // HasOne defines a has-one relationship
 func (e *Eloquent[T]) HasOne(related, foreignKey, localKey string) *Eloquent[T] {
 	if foreignKey == "" {
-		foreignKey = StringLibs.ConvertToSnakeCase(e.getModelName()) + "_id"
+		foreignKey = strlib.ConvertToSnakeCase(e.getModelName()) + "_id"
 	}
 	if localKey == "" {
 		localKey = "_id"
@@ -455,7 +455,7 @@ func (e *Eloquent[T]) HasOne(related, foreignKey, localKey string) *Eloquent[T] 
 // HasMany defines a has-many relationship
 func (e *Eloquent[T]) HasMany(related, foreignKey, localKey string) *Eloquent[T] {
 	if foreignKey == "" {
-		foreignKey = StringLibs.ConvertToSnakeCase(e.getModelName()) + "_id"
+		foreignKey = strlib.ConvertToSnakeCase(e.getModelName()) + "_id"
 	}
 	if localKey == "" {
 		localKey = "_id"
@@ -478,7 +478,7 @@ func (e *Eloquent[T]) BelongsToMany(related, pivotTable, foreignKey, relatedKey 
 		if models[0] > models[1] {
 			models[0], models[1] = models[1], models[0]
 		}
-		pivotTable = StringLibs.ConvertToSnakeCase(models[0]) + "_" + StringLibs.ConvertToSnakeCase(models[1])
+		pivotTable = strlib.ConvertToSnakeCase(models[0]) + "_" + strlib.ConvertToSnakeCase(models[1])
 	}
 	relation := Relation{
 		Name:    related,
@@ -1514,7 +1514,7 @@ func NewEloquentService[T BaseModels.MongoModel](ctx context.Context, db *mongo.
 		if t.Kind() == reflect.Ptr {
 			t = t.Elem()
 		}
-		return StringLibs.Pluralize(StringLibs.ConvertToSnakeCase(t.Name()))
+		return strlib.Pluralize(strlib.ConvertToSnakeCase(t.Name()))
 	}
 
 	eloquentService := &EloquentService[T]{
@@ -1814,8 +1814,8 @@ func (s *EloquentService[T]) GetRoutePrefix() string {
 		t = t.Elem()
 	}
 
-	hyphenated := StringLibs.Hyphenate(t.Name())
-	return StringLibs.Pluralize(strings.ToLower(hyphenated))
+	hyphenated := strlib.Hyphenate(t.Name())
+	return strlib.Pluralize(strings.ToLower(hyphenated))
 }
 
 // ToBson converts a model instance to bson.M by marshalling/unmarshalling inside the service.

@@ -1,4 +1,4 @@
-package BaseControllers
+package base
 
 import (
 	"net/http"

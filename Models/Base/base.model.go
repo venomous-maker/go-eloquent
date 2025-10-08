@@ -1,10 +1,10 @@
-package GoEloquentModels
+package base
 
 import (
 	"reflect"
 	"time"
 
-	StringLibs "github.com/venomous-maker/go-eloquent/src/Libs/Strings"
+	strlib "github.com/venomous-maker/go-eloquent/libs/strings"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -98,13 +98,13 @@ func (b *BaseModel) GetCollectionName() string {
 			field := t.Field(i)
 			if field.Anonymous && field.Type == reflect.TypeOf(BaseModel{}) {
 				// Found the embedded BaseModel
-				return StringLibs.Pluralize(StringLibs.ConvertToSnakeCase(t.Name()))
+				return strlib.Pluralize(strlib.ConvertToSnakeCase(t.Name()))
 			}
 		}
 	}
 
 	// Fallback
-	return StringLibs.Pluralize(StringLibs.ConvertToSnakeCase(t.Name()))
+	return strlib.Pluralize(strlib.ConvertToSnakeCase(t.Name()))
 }
 
 // GetTableName returns the name of the MongoDB collection associated with the model.

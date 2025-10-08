@@ -1,4 +1,4 @@
-package StringLibs
+package strlib
 
 import (
 	"regexp"
