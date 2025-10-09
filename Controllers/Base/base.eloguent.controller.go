@@ -127,8 +127,9 @@ func (bc *BaseController[T]) Update(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to convert model to bson", "details": err.Error(), "status": "fail"})
 		return
 	}
-	found, err := bc.Service.Query().WithTrashed().Find(objID.Hex())
+	found, err := bc.Service.Find(objID.Hex())
 	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Record not found", "details": err.Error(), "status": "fail"})
 		return
 	}
 
