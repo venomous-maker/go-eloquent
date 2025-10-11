@@ -1147,6 +1147,32 @@ func (s *EloquentService[T]) UpdateOrCreate(conditions bson.M, updates bson.M) (
 	return s.Find(result.GetID().Hex())
 }
 
+// CreateOrUpdate saves the model if it has no ID, otherwise updates the existing document.
+func (s *EloquentService[T]) CreateOrUpdate(model T) (T, error) {
+	// If no ID present, perform Save
+	if model.GetID().IsZero() {
+		return s.Save(model)
+	}
+
+	id := model.GetID().Hex()
+
+	// Convert model to bson and remove _id to avoid immutable field update
+	doc, err := s.ToBson(model)
+	if err != nil {
+		return model, err
+	}
+	delete(doc, "_id")
+
+	// Perform update
+	err = s.Update(id, doc)
+	if err != nil {
+		return model, err
+	}
+
+	// Return the fresh model
+	return s.Find(id)
+}
+
 // ==================== Enhanced EloquentService Interface ====================
 
 type EloquentInterface[T BaseModels.MongoModel] interface {
@@ -1470,9 +1496,12 @@ type EloquentServiceInterface[T BaseModels.MongoModel] interface {
 	Query() *Eloquent[T]
 
 	// Additional helpers
-	UpdateOrCreate(id string, updates bson.M) (T, error)
+	// UpdateOrCreate by conditions (matches implemented method signature)
+	UpdateOrCreate(conditions bson.M, updates bson.M) (T, error)
+	// CreateOrUpdate accepts a model instance and will save or update depending on ID
 	CreateOrUpdate(model T) (T, error)
-	FirstOrCreate(filter bson.M, newData T) (T, error)
+	// FirstOrCreate using condition/default maps (matches implemented method signature)
+	FirstOrCreate(conditions, defaults bson.M) (T, error)
 	Reload(model T) (T, error)
 
 	// Internal / helpers exposed for interface use
