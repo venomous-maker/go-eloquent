@@ -1,10 +1,8 @@
 package base
 
 import (
-	"reflect"
 	"time"
 
-	strlib "github.com/venomous-maker/go-eloquent/libs/strings"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -75,48 +73,19 @@ func (b *BaseModel) GetStatus() string {
 
 // GetCollectionName returns the name of the MongoDB collection associated with the model.
 //
-// It uses reflection to find the name of the struct that embeds BaseModel.
-// If the BaseModel is embedded, it will attempt to find the parent struct and use that instead.
-//
-// Parameters: None
-//
-// Returns:
-// The name of the MongoDB collection associated with the model.
+// IMPORTANT:
+//   - When called via an embedded BaseModel on a concrete struct, Go will bind the receiver to the
+//     embedded field (*BaseModel), so reflection here cannot reliably discover the outer concrete type.
+//   - To ensure correct collection resolution for concrete models, we deliberately return an empty
+//     string here. EloquentService will then fall back to deriving the collection name from the
+//     concrete model type (snake_case + plural).
+//   - If you need a custom collection name, override GetCollectionName on your concrete model type.
 func (b *BaseModel) GetCollectionName() string {
-	// Use reflection to get the name of the struct that embeds BaseModel
-	t := reflect.TypeOf(b)
-
-	// If it's a pointer, get the element
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	// If the BaseModel is embedded, move one level up
-	if t.Kind() == reflect.Struct {
-		// Attempt to find the parent struct (the one embedding BaseModel)
-		for i := 0; i < t.NumField(); i++ {
-			field := t.Field(i)
-			if field.Anonymous && field.Type == reflect.TypeOf(BaseModel{}) {
-				// Found the embedded BaseModel
-				return strlib.Pluralize(strlib.ConvertToSnakeCase(t.Name()))
-			}
-		}
-	}
-
-	// Fallback
-	return strlib.Pluralize(strlib.ConvertToSnakeCase(t.Name()))
+	return ""
 }
 
-// GetTableName returns the name of the MongoDB collection associated with the model.
-//
-// It is a part of the MongoModel interface.
-//
-// It simply calls GetCollectionName() and returns the result.
-//
-// Parameters: None
-//
-// Returns:
-// The name of the MongoDB collection associated with the model.
+// GetTableName returns the model's table/collection name.
+// Mirrors GetCollectionName behavior. Override on concrete models if you need a custom name.
 func (b *BaseModel) GetTableName() string {
 	return b.GetCollectionName()
 }

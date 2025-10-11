@@ -28,10 +28,10 @@ func TestSetTimestampsOnCreate(t *testing.T) {
 	}
 }
 
-func TestGetTableNameNotEmpty(t *testing.T) {
+func TestGetTableNameDefaultEmpty(t *testing.T) {
 	b := &base.BaseModel{}
 	name := b.GetTableName()
-	if name == "" {
-		t.Fatalf("expected non-empty table name")
+	if name != "" {
+		t.Fatalf("expected empty table/collection name by default, got %q", name)
 	}
 }
