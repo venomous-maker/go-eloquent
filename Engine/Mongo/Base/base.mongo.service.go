@@ -1763,7 +1763,7 @@ type EloquentServiceInterface[T BaseModels.MongoModel] interface {
 	UpdateOrCreate(conditions bson.M, model T) (T, error)
 	// CreateOrUpdate accepts a model instance and will save or update depending on ID
 	CreateOrUpdate(model T) (T, error)
-	// FirstOrCreate using condition/default maps (matches implemented method signature)
+	// FirstOrCreate using conditions and a model instance (matches implemented method signature)
 	FirstOrCreate(conditions bson.M, model T) (T, error)
 	Reload(model T) (T, error)
 
@@ -1785,7 +1785,7 @@ type EloquentServiceInterface[T BaseModels.MongoModel] interface {
 	FromBson(model *T, data bson.M) error
 	FromJson(model *T, data map[string]interface{}) error
 
-	// Cashe
+	// Cache configuration
 	SetDefaultCacheTTL(ttl time.Duration)
 	ClearCache()
 }
