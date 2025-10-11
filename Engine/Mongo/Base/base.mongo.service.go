@@ -8,6 +8,10 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	// added for caching
+	"crypto/sha256"
+	"encoding/hex"
+	"sync"
 
 	BaseModels "github.com/venomous-maker/go-eloquent/Models/Base"
 	strlib "github.com/venomous-maker/go-eloquent/libs/strings"
@@ -41,6 +45,61 @@ func resolveRelatedCollection(raw string) string {
 	return strlib.Pluralize(strlib.ConvertToSnakeCase(raw))
 }
 
+// ==================== In-memory TTL Cache (collection-scoped) ====================
+
+type cacheEntry struct {
+	payload []byte
+	expiry  time.Time
+}
+
+type serviceCache struct {
+	mu   sync.RWMutex
+	data map[string]map[string]cacheEntry // collection -> key -> entry
+}
+
+func (c *serviceCache) get(coll, key string) ([]byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	bucket, ok := c.data[coll]
+	if !ok {
+		return nil, false
+	}
+	entry, ok := bucket[key]
+	if !ok {
+		return nil, false
+	}
+	if !entry.expiry.IsZero() && time.Now().After(entry.expiry) {
+		return nil, false
+	}
+	return entry.payload, true
+}
+
+func (c *serviceCache) set(coll, key string, payload []byte, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.data == nil {
+		c.data = make(map[string]map[string]cacheEntry)
+	}
+	bucket, ok := c.data[coll]
+	if !ok {
+		bucket = make(map[string]cacheEntry)
+		c.data[coll] = bucket
+	}
+	bucket[key] = cacheEntry{payload: payload, expiry: time.Now().Add(ttl)}
+}
+
+func (c *serviceCache) invalidateCollection(coll string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.data == nil {
+		return
+	}
+	delete(c.data, coll)
+}
+
 // Eloquent is the main query builder struct similar to Laravel's Eloquent
 type Eloquent[T BaseModels.MongoModel] struct {
 	service        *EloquentService[T]
@@ -56,6 +115,7 @@ type Eloquent[T BaseModels.MongoModel] struct {
 	withCount      []string
 	scopes         []func(*Eloquent[T]) *Eloquent[T]
 	softDeleteMode int // 0=active(default),1=withTrashed,2=onlyTrashed
+	cacheTTL       *time.Duration
 }
 
 const (
@@ -589,6 +649,41 @@ func (e *Eloquent[T]) hasTrashedHandling() bool {
 	return false
 }
 
+// Cache enables query-level caching for this builder instance
+func (e *Eloquent[T]) Cache(ttl time.Duration) *Eloquent[T] {
+	e.cacheTTL = &ttl
+	return e
+}
+
+// cacheTTLOrDefault resolves effective TTL (query-level overrides service default)
+func (e *Eloquent[T]) cacheTTLOrDefault() time.Duration {
+	if e.cacheTTL != nil && *e.cacheTTL > 0 {
+		return *e.cacheTTL
+	}
+	if e.service != nil && e.service.defaultCacheTTL > 0 {
+		return e.service.defaultCacheTTL
+	}
+	return 0
+}
+
+// buildCacheKey constructs a stable cache key for the current query
+func (e *Eloquent[T]) buildCacheKey(filter bson.M, isAggregate bool) string {
+	keyObj := bson.M{
+		"collection": e.service.CollectionName,
+		"filter":     filter,
+		"orders":     e.orders,
+		"select":     e.selectFields,
+		"limit":      e.limitNum,
+		"skip":       e.skipNum,
+		"relations":  e.relations,
+		"withCount":  e.withCount,
+		"aggregate":  isAggregate,
+	}
+	bytes, _ := bson.Marshal(keyObj)
+	sum := sha256.Sum256(bytes)
+	return hex.EncodeToString(sum[:])
+}
+
 // Get retrieves all matching records
 func (e *Eloquent[T]) Get() ([]T, error) {
 	if len(e.relations) > 0 {
@@ -615,6 +710,35 @@ func (e *Eloquent[T]) Get() ([]T, error) {
 		opts.SetProjection(projection)
 	}
 
+	// Attempt cache
+	ttl := e.cacheTTLOrDefault()
+	if ttl > 0 && e.service != nil && e.service.cache != nil {
+		key := e.buildCacheKey(filter, false)
+		if payload, ok := e.service.cache.get(e.service.CollectionName, key); ok {
+			var docs []bson.M
+			if err := bson.Unmarshal(payload, &docs); err == nil {
+				results := make([]T, 0, len(docs))
+				for _, doc := range docs {
+					obj := e.service.Factory()
+					if e.service.BeforeFetch != nil {
+						if err := e.service.BeforeFetch(obj); err != nil {
+							continue
+						}
+					}
+					if err := e.service.FromBson(&obj, doc); err == nil {
+						if e.service.AfterFetch != nil {
+							if err := e.service.AfterFetch(obj); err != nil {
+								continue
+							}
+						}
+						results = append(results, obj)
+					}
+				}
+				return results, nil
+			}
+		}
+	}
+
 	cursor, err := e.service.Collection.Find(e.service.Ctx, filter, opts)
 	if err != nil {
 		return nil, err
@@ -622,6 +746,10 @@ func (e *Eloquent[T]) Get() ([]T, error) {
 	defer cursor.Close(e.service.Ctx)
 
 	var results []T
+	var docsForCache []bson.M
+	if ttl > 0 {
+		docsForCache = make([]bson.M, 0)
+	}
 	for cursor.Next(e.service.Ctx) {
 		obj := e.service.Factory()
 		if e.service.BeforeFetch != nil {
@@ -636,6 +764,19 @@ func (e *Eloquent[T]) Get() ([]T, error) {
 				}
 			}
 			results = append(results, obj)
+			if ttl > 0 {
+				if m, err := e.service.ToBson(obj); err == nil {
+					docsForCache = append(docsForCache, m)
+				}
+			}
+		}
+	}
+
+	// Store in cache
+	if ttl > 0 && e.service != nil && e.service.cache != nil {
+		key := e.buildCacheKey(filter, false)
+		if bytes, err := bson.Marshal(docsForCache); err == nil {
+			e.service.cache.set(e.service.CollectionName, key, bytes, ttl)
 		}
 	}
 
@@ -645,6 +786,39 @@ func (e *Eloquent[T]) Get() ([]T, error) {
 // getWithRelations handles eager loading
 func (e *Eloquent[T]) getWithRelations() ([]T, error) {
 	pipeline := e.buildAggregationPipeline()
+
+	// Attempt cache
+	ttl := e.cacheTTLOrDefault()
+	if ttl > 0 && e.service != nil && e.service.cache != nil {
+		keyObj := bson.M{"collection": e.service.CollectionName, "pipeline": pipeline, "op": "aggregate"}
+		bytesKey, _ := bson.Marshal(keyObj)
+		sum := sha256.Sum256(bytesKey)
+		key := hex.EncodeToString(sum[:])
+		if payload, ok := e.service.cache.get(e.service.CollectionName, key); ok {
+			var docs []bson.M
+			if err := bson.Unmarshal(payload, &docs); err == nil {
+				results := make([]T, 0, len(docs))
+				for _, doc := range docs {
+					obj := e.service.Factory()
+					if e.service.BeforeFetch != nil {
+						if err := e.service.BeforeFetch(obj); err != nil {
+							continue
+						}
+					}
+					if err := e.service.FromBson(&obj, doc); err == nil {
+						if e.service.AfterFetch != nil {
+							if err := e.service.AfterFetch(obj); err != nil {
+								continue
+							}
+						}
+						results = append(results, obj)
+					}
+				}
+				return results, nil
+			}
+		}
+	}
+
 	cursor, err := e.service.Collection.Aggregate(e.service.Ctx, pipeline)
 	if err != nil {
 		return nil, err
@@ -652,6 +826,10 @@ func (e *Eloquent[T]) getWithRelations() ([]T, error) {
 	defer cursor.Close(e.service.Ctx)
 
 	var results []T
+	var docsForCache []bson.M
+	if ttl > 0 {
+		docsForCache = make([]bson.M, 0)
+	}
 	for cursor.Next(e.service.Ctx) {
 		obj := e.service.Factory()
 		if e.service.BeforeFetch != nil {
@@ -666,6 +844,22 @@ func (e *Eloquent[T]) getWithRelations() ([]T, error) {
 				}
 			}
 			results = append(results, obj)
+			if ttl > 0 {
+				if m, err := e.service.ToBson(obj); err == nil {
+					docsForCache = append(docsForCache, m)
+				}
+			}
+		}
+	}
+
+	// Store in cache
+	if ttl > 0 && e.service != nil && e.service.cache != nil {
+		keyObj := bson.M{"collection": e.service.CollectionName, "pipeline": pipeline, "op": "aggregate"}
+		bytesKey, _ := bson.Marshal(keyObj)
+		sum := sha256.Sum256(bytesKey)
+		key := hex.EncodeToString(sum[:])
+		if bytes, err := bson.Marshal(docsForCache); err == nil {
+			e.service.cache.set(e.service.CollectionName, key, bytes, ttl)
 		}
 	}
 
@@ -886,9 +1080,8 @@ func (e *Eloquent[T]) Paginate(page, perPage int) ([]T, int64, error) {
 		perPage = 15 // Laravel default
 	}
 
-	// Count total
-	filter := e.buildFilter()
-	total, err := e.service.Collection.CountDocuments(e.service.Ctx, filter)
+	// Count total using cached Count()
+	total, err := e.Clone().Count()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -904,7 +1097,47 @@ func (e *Eloquent[T]) Paginate(page, perPage int) ([]T, int64, error) {
 // Count returns the count of matching records
 func (e *Eloquent[T]) Count() (int64, error) {
 	filter := e.buildFilter()
-	return e.service.Collection.CountDocuments(e.service.Ctx, filter)
+
+	// Cache for count
+	ttl := e.cacheTTLOrDefault()
+	if ttl > 0 && e.service != nil && e.service.cache != nil {
+		keyObj := bson.M{
+			"collection": e.service.CollectionName,
+			"filter":     filter,
+			"op":         "count",
+		}
+		bytesKey, _ := bson.Marshal(keyObj)
+		sum := sha256.Sum256(bytesKey)
+		key := hex.EncodeToString(sum[:])
+		if payload, ok := e.service.cache.get(e.service.CollectionName, key); ok {
+			var wrap struct {
+				Count int64 `bson:"count"`
+			}
+			if err := bson.Unmarshal(payload, &wrap); err == nil {
+				return wrap.Count, nil
+			}
+		}
+	}
+
+	count, err := e.service.Collection.CountDocuments(e.service.Ctx, filter)
+	if err != nil {
+		return 0, err
+	}
+	if ttl > 0 && e.service != nil && e.service.cache != nil {
+		wrap := bson.M{"count": count}
+		if bytes, err := bson.Marshal(wrap); err == nil {
+			e.service.cache.set(e.service.CollectionName, keyForCount(e.service.CollectionName, filter), bytes, ttl)
+		}
+	}
+	return count, nil
+}
+
+// keyForCount builds a stable key for count queries (separate from Get keys)
+func keyForCount(coll string, filter bson.M) string {
+	keyObj := bson.M{"collection": coll, "filter": filter, "op": "count"}
+	bytesKey, _ := bson.Marshal(keyObj)
+	sum := sha256.Sum256(bytesKey)
+	return hex.EncodeToString(sum[:])
 }
 
 // Exists checks if any records exist
@@ -948,6 +1181,11 @@ func (e *Eloquent[T]) Update(updates bson.M) (int64, error) {
 	result, err := e.service.Collection.UpdateMany(e.service.Ctx, filter, bson.M{"$set": updates})
 	if err != nil {
 		return 0, err
+	}
+
+	// Invalidate cache for this collection on write
+	if e.service != nil && e.service.cache != nil {
+		e.service.cache.invalidateCollection(e.service.CollectionName)
 	}
 
 	// AfterUpdate hooks
@@ -1004,6 +1242,10 @@ func (e *Eloquent[T]) Delete() (int64, error) {
 			_ = e.service.AfterDelete(id.Hex())
 		}
 	}
+	// Invalidate cache after delete
+	if e.service != nil && e.service.cache != nil {
+		e.service.cache.invalidateCollection(e.service.CollectionName)
+	}
 	return res.ModifiedCount, nil
 }
 
@@ -1033,6 +1275,10 @@ func (e *Eloquent[T]) ForceDelete() (int64, error) {
 		for _, id := range ids {
 			_ = e.service.AfterDelete(id.Hex())
 		}
+	}
+	// Invalidate cache after force delete
+	if e.service != nil && e.service.cache != nil {
+		e.service.cache.invalidateCollection(e.service.CollectionName)
 	}
 	return result.DeletedCount, nil
 }
@@ -1099,6 +1345,11 @@ func (s *EloquentService[T]) Create(data bson.M) (T, error) {
 		return model, err
 	}
 
+	// Invalidate cache for this collection on write
+	if s.cache != nil {
+		s.cache.invalidateCollection(s.CollectionName)
+	}
+
 	// After create hook
 	if s.AfterCreate != nil {
 		_ = s.AfterCreate(model)
@@ -1108,7 +1359,11 @@ func (s *EloquentService[T]) Create(data bson.M) (T, error) {
 }
 
 // FirstOrCreate finds first record or creates if not found
-func (s *EloquentService[T]) FirstOrCreate(conditions bson.M, defaults bson.M) (T, error) {
+func (s *EloquentService[T]) FirstOrCreate(conditions bson.M, model T) (T, error) {
+	defaults, err := s.ToBson(model)
+	if err != nil {
+		return model, err
+	}
 	qb := s.Query().WhereMap(conditions)
 	result, err := qb.First()
 	if err == mongo.ErrNoDocuments {
@@ -1125,7 +1380,11 @@ func (s *EloquentService[T]) FirstOrCreate(conditions bson.M, defaults bson.M) (
 }
 
 // UpdateOrCreate updates existing record or creates new one
-func (s *EloquentService[T]) UpdateOrCreate(conditions bson.M, updates bson.M) (T, error) {
+func (s *EloquentService[T]) UpdateOrCreate(conditions bson.M, model T) (T, error) {
+	updates, err := s.ToBson(model)
+	if err != nil {
+		return model, err
+	}
 	qb := s.Query().WhereMap(conditions)
 	result, err := qb.First()
 	if err == mongo.ErrNoDocuments {
@@ -1475,6 +1734,10 @@ type EloquentService[T BaseModels.MongoModel] struct {
 	AfterDelete  func(id string) error
 	BeforeFetch  func(model T) error
 	AfterFetch   func(model T) error
+
+	// Caching
+	cache           *serviceCache
+	defaultCacheTTL time.Duration
 }
 
 // EloquentServiceInterface defines the main service operations for a model T.
@@ -1497,11 +1760,11 @@ type EloquentServiceInterface[T BaseModels.MongoModel] interface {
 
 	// Additional helpers
 	// UpdateOrCreate by conditions (matches implemented method signature)
-	UpdateOrCreate(conditions bson.M, updates bson.M) (T, error)
+	UpdateOrCreate(conditions bson.M, model T) (T, error)
 	// CreateOrUpdate accepts a model instance and will save or update depending on ID
 	CreateOrUpdate(model T) (T, error)
 	// FirstOrCreate using condition/default maps (matches implemented method signature)
-	FirstOrCreate(conditions, defaults bson.M) (T, error)
+	FirstOrCreate(conditions bson.M, model T) (T, error)
 	Reload(model T) (T, error)
 
 	// Internal / helpers exposed for interface use
@@ -1521,6 +1784,10 @@ type EloquentServiceInterface[T BaseModels.MongoModel] interface {
 	ToJson(model T) (map[string]interface{}, error)
 	FromBson(model *T, data bson.M) error
 	FromJson(model *T, data map[string]interface{}) error
+
+	// Cashe
+	SetDefaultCacheTTL(ttl time.Duration)
+	ClearCache()
 }
 
 // NewEloquentService returns a new EloquentService instance.
@@ -1551,6 +1818,7 @@ func NewEloquentService[T BaseModels.MongoModel](ctx context.Context, db *mongo.
 		DB:         db,
 		Collection: db.Collection(getCollectionName(model)),
 		Factory:    factory,
+		cache:      &serviceCache{},
 	}
 
 	// Define a local function to get the collection name with custom logic
@@ -1611,6 +1879,10 @@ func (s *EloquentService[T]) Save(model T) (T, error) {
 	if oid, ok := res.InsertedID.(primitive.ObjectID); ok {
 		model.SetID(oid)
 	}
+	// Invalidate cache for this collection on write
+	if s.cache != nil {
+		s.cache.invalidateCollection(s.CollectionName)
+	}
 	if s.AfterCreate != nil {
 		_ = s.AfterCreate(model)
 	}
@@ -1650,10 +1922,16 @@ func (s *EloquentService[T]) Update(id string, updates bson.M) error {
 		}
 	}
 	_, err = s.Collection.UpdateOne(s.Ctx, bson.M{"_id": objID}, bson.M{"$set": updates})
-	if err == nil && s.AfterUpdate != nil {
-		model, findErr := s.Find(id)
-		if findErr == nil {
-			_ = s.AfterUpdate(model)
+	if err == nil {
+		// Invalidate cache on write
+		if s.cache != nil {
+			s.cache.invalidateCollection(s.CollectionName)
+		}
+		if s.AfterUpdate != nil {
+			model, findErr := s.Find(id)
+			if findErr == nil {
+				_ = s.AfterUpdate(model)
+			}
 		}
 	}
 	return err
@@ -1671,8 +1949,13 @@ func (s *EloquentService[T]) Delete(id string) error {
 		return err
 	}
 	_, err = s.Collection.UpdateOne(s.Ctx, bson.M{"_id": objID}, bson.M{"$set": bson.M{"deleted_at": time.Now()}})
-	if err == nil && s.AfterDelete != nil {
-		_ = s.AfterDelete(id)
+	if err == nil {
+		if s.cache != nil {
+			s.cache.invalidateCollection(s.CollectionName)
+		}
+		if s.AfterDelete != nil {
+			_ = s.AfterDelete(id)
+		}
 	}
 	return err
 }
@@ -1684,6 +1967,11 @@ func (s *EloquentService[T]) Restore(id string) error {
 		return err
 	}
 	_, err = s.Collection.UpdateOne(s.Ctx, bson.M{"_id": objID}, bson.M{"$set": bson.M{"deleted_at": time.Time{}}})
+	if err == nil {
+		if s.cache != nil {
+			s.cache.invalidateCollection(s.CollectionName)
+		}
+	}
 	return err
 }
 
@@ -1699,8 +1987,13 @@ func (s *EloquentService[T]) ForceDelete(id string) error {
 		return err
 	}
 	_, err = s.Collection.DeleteOne(s.Ctx, bson.M{"_id": objID})
-	if err == nil && s.AfterDelete != nil {
-		_ = s.AfterDelete(id)
+	if err == nil {
+		if s.cache != nil {
+			s.cache.invalidateCollection(s.CollectionName)
+		}
+		if s.AfterDelete != nil {
+			_ = s.AfterDelete(id)
+		}
 	}
 	return err
 }
@@ -1845,6 +2138,18 @@ func (s *EloquentService[T]) GetRoutePrefix() string {
 
 	hyphenated := strlib.Hyphenate(t.Name())
 	return strlib.Pluralize(strings.ToLower(hyphenated))
+}
+
+// SetDefaultCacheTTL configures a default TTL for read-query caching on this service
+func (s *EloquentService[T]) SetDefaultCacheTTL(ttl time.Duration) {
+	s.defaultCacheTTL = ttl
+}
+
+// ClearCache clears all cached queries for this service's collection
+func (s *EloquentService[T]) ClearCache() {
+	if s.cache != nil {
+		s.cache.invalidateCollection(s.CollectionName)
+	}
 }
 
 // ToBson converts a model instance to bson.M by marshalling/unmarshalling inside the service.

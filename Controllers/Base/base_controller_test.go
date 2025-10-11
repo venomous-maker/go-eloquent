@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	BaseControllers "github.com/venomous-maker/go-eloquent/Controllers/Base"
@@ -44,7 +45,18 @@ func (m *MockService) ForceDelete(id string) error             { return nil }
 func (m *MockService) Query() *BaseServices.Eloquent[*TestUser] {
 	return &BaseServices.Eloquent[*TestUser]{}
 }
-func (m *MockService) UpdateOrCreate(id string, updates bson.M) (*TestUser, error) {
+
+func (m *MockService) SetDefaultCacheTTL(ttl time.Duration) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (m *MockService) ClearCache() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (m *MockService) UpdateOrCreate(conditions bson.M, model *TestUser) (*TestUser, error) {
 	return &TestUser{BaseModel: &BaseModels.BaseModel{}}, nil
 }
 func (m *MockService) CreateOrUpdate(model *TestUser) (*TestUser, error) { return model, nil }
