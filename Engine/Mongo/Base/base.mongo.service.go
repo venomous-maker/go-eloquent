@@ -126,7 +126,7 @@ const (
 
 // Relation represents a relationship configuration
 type Relation struct {
-	Name       string               // The relationship name
+	Name       string               // The relationship name (source token)
 	Type       RelationType         // belongsTo, hasOne, hasMany, etc.
 	Related    string               // Related collection name
 	ForeignKey string               // Foreign key field
@@ -135,6 +135,15 @@ type Relation struct {
 	Pivot      *PivotConfig         // For many-to-many relationships
 	Nested     map[string]*Relation // Nested relationships
 	Required   bool                 // Inner join vs left join
+	As         string               // Optional alias for where to attach the relation in the resulting document
+}
+
+// OutputField returns the field name the relation should be attached to
+func (r Relation) OutputField() string {
+	if strings.TrimSpace(r.As) != "" {
+		return r.As
+	}
+	return r.Name
 }
 
 type RelationType string
@@ -370,7 +379,7 @@ func (e *Eloquent[T]) Offset(offset int) *Eloquent[T] {
 // With loads relationships (eager loading)
 func (e *Eloquent[T]) With(relations ...string) *Eloquent[T] {
 	for _, rel := range relations {
-		// Parse nested relationships like "user.profile"
+		// Parse nested relationships like "user.profile" and optional alias using " as "
 		parts := strings.Split(rel, ".")
 		e.addRelation(parts, nil)
 	}
@@ -389,13 +398,27 @@ func (e *Eloquent[T]) Load(model T, relations ...string) T {
 	return model
 }
 
+// parseRelToken parses a relation token and optional alias in the form "name as alias" (case-insensitive)
+func parseRelToken(token string) (name string, alias string) {
+	t := strings.TrimSpace(token)
+	// case-insensitive split on " as "
+	lower := strings.ToLower(t)
+	if idx := strings.Index(lower, " as "); idx != -1 {
+		name = strings.TrimSpace(t[:idx])
+		alias = strings.TrimSpace(t[idx+4:])
+		return
+	}
+	return t, ""
+}
+
 // addRelation helper to build relation tree
 func (e *Eloquent[T]) addRelation(parts []string, parent *Relation) {
 	if len(parts) == 0 {
 		return
 	}
 
-	relName := parts[0]
+	relToken := parts[0]
+	relName, relAlias := parseRelToken(relToken)
 	remaining := parts[1:]
 
 	// Find or create relation
@@ -410,8 +433,13 @@ func (e *Eloquent[T]) addRelation(parts []string, parent *Relation) {
 		}
 		if relation == nil {
 			newRel := e.inferRelation(relName)
+			// attach alias if provided
+			newRel.As = relAlias
 			e.relations = append(e.relations, newRel)
 			relation = &e.relations[len(e.relations)-1]
+		} else if relAlias != "" {
+			// if relation exists and alias provided, update alias
+			relation.As = relAlias
 		}
 	} else {
 		// Nested relation
@@ -420,8 +448,12 @@ func (e *Eloquent[T]) addRelation(parts []string, parent *Relation) {
 		}
 		if rel, exists := parent.Nested[relName]; exists {
 			relation = rel
+			if relAlias != "" {
+				relation.As = relAlias
+			}
 		} else {
 			newRel := e.inferRelation(relName)
+			newRel.As = relAlias
 			parent.Nested[relName] = &newRel
 			relation = parent.Nested[relName]
 		}
@@ -476,18 +508,21 @@ func (e *Eloquent[T]) getModelName() string {
 
 // BelongsTo defines a belongs-to relationship
 func (e *Eloquent[T]) BelongsTo(related, foreignKey, localKey string) *Eloquent[T] {
+	// allow alias in related param, e.g., "user as created_by"
+	baseRelated, alias := parseRelToken(related)
 	if foreignKey == "" {
-		foreignKey = strlib.ConvertToSnakeCase(related) + "_id"
+		foreignKey = strlib.ConvertToSnakeCase(baseRelated) + "_id"
 	}
 	if localKey == "" {
 		localKey = "_id"
 	}
 	relation := Relation{
-		Name:       related,
+		Name:       baseRelated,
 		Type:       BelongsTo,
-		Related:    resolveRelatedCollection(related),
+		Related:    resolveRelatedCollection(baseRelated),
 		ForeignKey: foreignKey,
 		LocalKey:   localKey,
+		As:         alias,
 	}
 	e.relations = append(e.relations, relation)
 	return e
@@ -495,6 +530,7 @@ func (e *Eloquent[T]) BelongsTo(related, foreignKey, localKey string) *Eloquent[
 
 // HasOne defines a has-one relationship
 func (e *Eloquent[T]) HasOne(related, foreignKey, localKey string) *Eloquent[T] {
+	baseRelated, alias := parseRelToken(related)
 	if foreignKey == "" {
 		foreignKey = strlib.ConvertToSnakeCase(e.getModelName()) + "_id"
 	}
@@ -502,11 +538,12 @@ func (e *Eloquent[T]) HasOne(related, foreignKey, localKey string) *Eloquent[T] 
 		localKey = "_id"
 	}
 	relation := Relation{
-		Name:       related,
+		Name:       baseRelated,
 		Type:       HasOne,
-		Related:    resolveRelatedCollection(related),
+		Related:    resolveRelatedCollection(baseRelated),
 		ForeignKey: foreignKey,
 		LocalKey:   localKey,
+		As:         alias,
 	}
 	e.relations = append(e.relations, relation)
 	return e
@@ -514,6 +551,7 @@ func (e *Eloquent[T]) HasOne(related, foreignKey, localKey string) *Eloquent[T] 
 
 // HasMany defines a has-many relationship
 func (e *Eloquent[T]) HasMany(related, foreignKey, localKey string) *Eloquent[T] {
+	baseRelated, alias := parseRelToken(related)
 	if foreignKey == "" {
 		foreignKey = strlib.ConvertToSnakeCase(e.getModelName()) + "_id"
 	}
@@ -521,11 +559,12 @@ func (e *Eloquent[T]) HasMany(related, foreignKey, localKey string) *Eloquent[T]
 		localKey = "_id"
 	}
 	relation := Relation{
-		Name:       related,
+		Name:       baseRelated,
 		Type:       HasMany,
-		Related:    resolveRelatedCollection(related),
+		Related:    resolveRelatedCollection(baseRelated),
 		ForeignKey: foreignKey,
 		LocalKey:   localKey,
+		As:         alias,
 	}
 	e.relations = append(e.relations, relation)
 	return e
@@ -533,22 +572,24 @@ func (e *Eloquent[T]) HasMany(related, foreignKey, localKey string) *Eloquent[T]
 
 // BelongsToMany defines a many-to-many relationship
 func (e *Eloquent[T]) BelongsToMany(related, pivotTable, foreignKey, relatedKey string) *Eloquent[T] {
+	baseRelated, alias := parseRelToken(related)
 	if pivotTable == "" {
-		models := []string{e.getModelName(), related}
+		models := []string{e.getModelName(), baseRelated}
 		if models[0] > models[1] {
 			models[0], models[1] = models[1], models[0]
 		}
 		pivotTable = strlib.ConvertToSnakeCase(models[0]) + "_" + strlib.ConvertToSnakeCase(models[1])
 	}
 	relation := Relation{
-		Name:    related,
+		Name:    baseRelated,
 		Type:    BelongsToMany,
-		Related: resolveRelatedCollection(related),
+		Related: resolveRelatedCollection(baseRelated),
 		Pivot: &PivotConfig{
 			Table:      pivotTable,
 			ForeignKey: foreignKey,
 			RelatedKey: relatedKey,
 		},
+		As: alias,
 	}
 	e.relations = append(e.relations, relation)
 	return e
@@ -743,7 +784,12 @@ func (e *Eloquent[T]) Get() ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(e.service.Ctx)
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+
+		}
+	}(cursor, e.service.Ctx)
 
 	var results []T
 	var docsForCache []bson.M
@@ -889,9 +935,13 @@ func (e *Eloquent[T]) buildAggregationPipeline() []bson.M {
 		}
 		addFields := bson.M{}
 		for _, rel := range e.relations {
-			if _, ok := countSet[rel.Name]; ok {
+			// allow either the original relation name or the alias to be referenced in WithCount
+			_, okBase := countSet[rel.Name]
+			_, okAlias := countSet[rel.OutputField()]
+			if okBase || okAlias {
 				if rel.Type == HasMany || rel.Type == BelongsToMany { // arrays
-					addFields[rel.Name+"_count"] = bson.M{"$size": bson.M{"$ifNull": []interface{}{"$" + rel.Name, []interface{}{}}}}
+					field := rel.OutputField()
+					addFields[field+"_count"] = bson.M{"$size": bson.M{"$ifNull": []interface{}{"$" + field, []interface{}{}}}}
 				}
 			}
 		}
@@ -919,6 +969,7 @@ func (e *Eloquent[T]) buildAggregationPipeline() []bson.M {
 // buildLookupStage builds lookup stages for a relationship (with conditions support)
 func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 	stages := []bson.M{}
+	outField := rel.OutputField()
 
 	switch rel.Type {
 	case BelongsTo:
@@ -939,10 +990,10 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 					}
 					return nil
 				}()...),
-			"as": rel.Name,
+			"as": outField,
 		}}
 		stages = append(stages, lookup)
-		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + rel.Name, "preserveNullAndEmptyArrays": !rel.Required}})
+		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !rel.Required}})
 	case HasOne:
 		lookup := bson.M{"$lookup": bson.M{
 			"from": rel.Related,
@@ -960,10 +1011,10 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 					}
 					return nil
 				}()...),
-			"as": rel.Name,
+			"as": outField,
 		}}
 		stages = append(stages, lookup)
-		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + rel.Name, "preserveNullAndEmptyArrays": !rel.Required}})
+		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !rel.Required}})
 	case HasMany:
 		lookup := bson.M{"$lookup": bson.M{
 			"from": rel.Related,
@@ -981,26 +1032,27 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 					}
 					return nil
 				}()...),
-			"as": rel.Name,
+			"as": outField,
 		}}
 		stages = append(stages, lookup)
 		if rel.Required {
-			stages = append(stages, bson.M{"$match": bson.M{"$expr": bson.M{"$gt": bson.A{bson.M{"$size": "$" + rel.Name}, 0}}}})
+			stages = append(stages, bson.M{"$match": bson.M{"$expr": bson.M{"$gt": bson.A{bson.M{"$size": "$" + outField}, 0}}}})
 		}
 	case BelongsToMany:
 		if rel.Pivot != nil {
 			// pivot lookup
+			pivotField := outField + "_pivot"
 			pivotLookup := bson.M{"$lookup": bson.M{
 				"from":         rel.Pivot.Table,
 				"localField":   "_id",
 				"foreignField": rel.Pivot.ForeignKey,
-				"as":           rel.Name + "_pivot",
+				"as":           pivotField,
 			}}
 			stages = append(stages, pivotLookup)
 			// related lookup using pipeline for conditions
 			relatedLookup := bson.M{"$lookup": bson.M{
 				"from": rel.Related,
-				"let":  bson.M{"relIds": "$" + rel.Name + "_pivot." + rel.Pivot.RelatedKey},
+				"let":  bson.M{"relIds": "$" + pivotField + "." + rel.Pivot.RelatedKey},
 				"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{"$in": bson.A{"$_id", "$$relIds"}}}}},
 					func() []bson.M {
 						if len(rel.Conditions) > 0 {
@@ -1008,11 +1060,11 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 						}
 						return nil
 					}()...),
-				"as": rel.Name,
+				"as": outField,
 			}}
 			stages = append(stages, relatedLookup)
 			if rel.Required {
-				stages = append(stages, bson.M{"$match": bson.M{"$expr": bson.M{"$gt": bson.A{bson.M{"$size": "$" + rel.Name}, 0}}}})
+				stages = append(stages, bson.M{"$match": bson.M{"$expr": bson.M{"$gt": bson.A{bson.M{"$size": "$" + outField}, 0}}}})
 			}
 		}
 	}
@@ -1499,7 +1551,12 @@ func (e *Eloquent[T]) Raw(pipeline []bson.M) ([]bson.M, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(e.service.Ctx)
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+
+		}
+	}(cursor, e.service.Ctx)
 
 	var results []bson.M
 	for cursor.Next(e.service.Ctx) {
@@ -1620,7 +1677,12 @@ func (e *Eloquent[T]) Explain() (bson.M, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(e.service.Ctx)
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+
+		}
+	}(cursor, e.service.Ctx)
 
 	// Return explain plan (simplified)
 	return bson.M{
@@ -1691,7 +1753,10 @@ func (s *EloquentService[T]) WithTransaction(fn func(*mongo.SessionContext) erro
 		}
 
 		if err := fn(&sc); err != nil {
-			session.AbortTransaction(sc)
+			err_ := session.AbortTransaction(sc)
+			if err_ != nil {
+				return err_
+			}
 			return err
 		}
 
@@ -1710,6 +1775,9 @@ users, _ := userService.ORM().Query().WhereIn("_id", ids).Get()
 
 // HasMany where parent local key is an array (e.g., product.valuer_ids -> users._id)
 products, _ := productService.ORM().Query().HasMany("users", "_id", "valuer_ids").Get()
+
+// Alias a relation field while eager loading
+posts, _ := postService.ORM().Query().With("user as created_by").Get()
 
 */
 
