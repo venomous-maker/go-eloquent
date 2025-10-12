@@ -390,8 +390,14 @@ func (e *Eloquent[T]) Offset(offset int) *Eloquent[T] {
 // With loads relationships (eager loading)
 func (e *Eloquent[T]) With(relations ...string) *Eloquent[T] {
 	for _, rel := range relations {
-		// Parse nested relationships like "user.profile" and optional alias using " as "
-		parts := strings.Split(rel, ".")
+		// parse alias first so aliases containing dots are preserved like "cm_products.periods as products.periods"
+		name, alias := parseRelToken(rel)
+		// split the relation path on '.' but keep alias attached to the last part
+		parts := strings.Split(name, ".")
+		if alias != "" && len(parts) > 0 {
+			last := parts[len(parts)-1]
+			parts[len(parts)-1] = last + " as " + alias
+		}
 		e.addRelation(parts, nil)
 	}
 	return e
@@ -1038,65 +1044,84 @@ func (e *Eloquent[T]) buildNestedLookupStages(child Relation) []bson.M {
 	outField := sanitizeOutField(child.OutputField(), child.Name)
 	switch child.Type {
 	case BelongsTo:
+		// Build expression depending on whether foreign key is provided or parent provides ids
+		var expr bson.M
+		if child.ForeignKey == "" {
+			expr = bson.M{"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$fk"},
+				"then": bson.M{"$in": bson.A{"$_id", "$$fk"}},
+				"else": bson.M{"$eq": bson.A{"$_id", "$$fk"}},
+			}}
+		} else {
+			expr = bson.M{"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$fk"},
+				"then": bson.M{"$in": bson.A{"$" + child.LocalKey, "$$fk"}},
+				"else": bson.M{"$eq": bson.A{"$" + child.LocalKey, "$$fk"}},
+			}}
+		}
+		inner := []bson.M{{"$match": bson.M{"$expr": expr}}}
+		if len(child.Conditions) > 0 {
+			inner = append(inner, bson.M{"$match": child.Conditions})
+		}
 		lookup := bson.M{"$lookup": bson.M{
-			"from": child.Related,
-			"let":  bson.M{"fk": "$" + child.ForeignKey},
-			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-				"$cond": bson.M{
-					"if":   bson.M{"$isArray": "$$fk"},
-					"then": bson.M{"$in": bson.A{"$" + child.LocalKey, "$$fk"}},
-					"else": bson.M{"$eq": bson.A{"$" + child.LocalKey, "$$fk"}},
-				},
-			}}}},
-				func() []bson.M {
-					if len(child.Conditions) > 0 {
-						return []bson.M{{"$match": child.Conditions}}
-					}
-					return nil
-				}()...),
-			"as": outField,
+			"from":     child.Related,
+			"let":      bson.M{"fk": "$$fk"},
+			"pipeline": inner,
+			"as":       outField,
 		}}
 		stages = append(stages, lookup)
 		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !child.Required}})
 	case HasOne:
+		var expr bson.M
+		if child.ForeignKey == "" {
+			expr = bson.M{"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$local"},
+				"then": bson.M{"$in": bson.A{"$_id", "$$local"}},
+				"else": bson.M{"$eq": bson.A{"$_id", "$$local"}},
+			}}
+		} else {
+			expr = bson.M{"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$local"},
+				"then": bson.M{"$in": bson.A{"$" + child.ForeignKey, "$$local"}},
+				"else": bson.M{"$eq": bson.A{"$" + child.ForeignKey, "$$local"}},
+			}}
+		}
+		inner := []bson.M{{"$match": bson.M{"$expr": expr}}}
+		if len(child.Conditions) > 0 {
+			inner = append(inner, bson.M{"$match": child.Conditions})
+		}
 		lookup := bson.M{"$lookup": bson.M{
-			"from": child.Related,
-			"let":  bson.M{"local": "$" + child.LocalKey},
-			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-				"$cond": bson.M{
-					"if":   bson.M{"$isArray": "$$local"},
-					"then": bson.M{"$in": bson.A{"$" + child.ForeignKey, "$$local"}},
-					"else": bson.M{"$eq": bson.A{"$" + child.ForeignKey, "$$local"}},
-				},
-			}}}},
-				func() []bson.M {
-					if len(child.Conditions) > 0 {
-						return []bson.M{{"$match": child.Conditions}}
-					}
-					return nil
-				}()...),
-			"as": outField,
+			"from":     child.Related,
+			"let":      bson.M{"local": "$$local"},
+			"pipeline": inner,
+			"as":       outField,
 		}}
 		stages = append(stages, lookup)
 		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !child.Required}})
 	case HasMany:
+		var expr bson.M
+		if child.ForeignKey == "" {
+			expr = bson.M{"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$local"},
+				"then": bson.M{"$in": bson.A{"$_id", "$$local"}},
+				"else": bson.M{"$eq": bson.A{"$_id", "$$local"}},
+			}}
+		} else {
+			expr = bson.M{"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$local"},
+				"then": bson.M{"$in": bson.A{"$" + child.ForeignKey, "$$local"}},
+				"else": bson.M{"$eq": bson.A{"$" + child.ForeignKey, "$$local"}},
+			}}
+		}
+		inner := []bson.M{{"$match": bson.M{"$expr": expr}}}
+		if len(child.Conditions) > 0 {
+			inner = append(inner, bson.M{"$match": child.Conditions})
+		}
 		lookup := bson.M{"$lookup": bson.M{
-			"from": child.Related,
-			"let":  bson.M{"local": "$" + child.LocalKey},
-			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-				"$cond": bson.M{
-					"if":   bson.M{"$isArray": "$$local"},
-					"then": bson.M{"$in": bson.A{"$" + child.ForeignKey, "$$local"}},
-					"else": bson.M{"$eq": bson.A{"$" + child.ForeignKey, "$$local"}},
-				},
-			}}}},
-				func() []bson.M {
-					if len(child.Conditions) > 0 {
-						return []bson.M{{"$match": child.Conditions}}
-					}
-					return nil
-				}()...),
-			"as": outField,
+			"from":     child.Related,
+			"let":      bson.M{"local": "$$local"},
+			"pipeline": inner,
+			"as":       outField,
 		}}
 		stages = append(stages, lookup)
 		if child.Required {
@@ -1113,13 +1138,26 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 
 	switch rel.Type {
 	case BelongsTo:
-		inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-			"$cond": bson.M{
+		// choose let binding and expr depending on presence of ForeignKey
+		var letMap bson.M
+		var expr bson.M
+		if rel.ForeignKey == "" {
+			// parent provides related ids in local field
+			letMap = bson.M{"local": "$" + rel.LocalKey}
+			expr = bson.M{"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$local"},
+				"then": bson.M{"$in": bson.A{"$_id", "$$local"}},
+				"else": bson.M{"$eq": bson.A{"$_id", "$$local"}},
+			}}
+		} else {
+			letMap = bson.M{"fk": "$" + rel.ForeignKey}
+			expr = bson.M{"$cond": bson.M{
 				"if":   bson.M{"$isArray": "$$fk"},
 				"then": bson.M{"$in": bson.A{"$" + rel.LocalKey, "$$fk"}},
 				"else": bson.M{"$eq": bson.A{"$" + rel.LocalKey, "$$fk"}},
-			},
-		}}}}
+			}}
+		}
+		inner := []bson.M{{"$match": bson.M{"$expr": expr}}}
 		if len(rel.Conditions) > 0 {
 			inner = append(inner, bson.M{"$match": rel.Conditions})
 		}
@@ -1130,20 +1168,29 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 		}
 		lookup := bson.M{"$lookup": bson.M{
 			"from":     rel.Related,
-			"let":      bson.M{"fk": "$" + rel.ForeignKey},
+			"let":      letMap,
 			"pipeline": inner,
 			"as":       outField,
 		}}
 		stages = append(stages, lookup)
 		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !rel.Required}})
 	case HasOne:
-		inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-			"$cond": bson.M{
+		var letMap bson.M = bson.M{"local": "$" + rel.LocalKey}
+		var expr bson.M
+		if rel.ForeignKey == "" {
+			expr = bson.M{"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$local"},
+				"then": bson.M{"$in": bson.A{"$_id", "$$local"}},
+				"else": bson.M{"$eq": bson.A{"$_id", "$$local"}},
+			}}
+		} else {
+			expr = bson.M{"$cond": bson.M{
 				"if":   bson.M{"$isArray": "$$local"},
 				"then": bson.M{"$in": bson.A{"$" + rel.ForeignKey, "$$local"}},
 				"else": bson.M{"$eq": bson.A{"$" + rel.ForeignKey, "$$local"}},
-			},
-		}}}}
+			}}
+		}
+		inner := []bson.M{{"$match": bson.M{"$expr": expr}}}
 		if len(rel.Conditions) > 0 {
 			inner = append(inner, bson.M{"$match": rel.Conditions})
 		}
@@ -1154,20 +1201,29 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 		}
 		lookup := bson.M{"$lookup": bson.M{
 			"from":     rel.Related,
-			"let":      bson.M{"local": "$" + rel.LocalKey},
+			"let":      letMap,
 			"pipeline": inner,
 			"as":       outField,
 		}}
 		stages = append(stages, lookup)
 		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !rel.Required}})
 	case HasMany:
-		inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-			"$cond": bson.M{
+		letMap := bson.M{"local": "$" + rel.LocalKey}
+		var expr bson.M
+		if rel.ForeignKey == "" {
+			expr = bson.M{"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$local"},
+				"then": bson.M{"$in": bson.A{"$_id", "$$local"}},
+				"else": bson.M{"$eq": bson.A{"$_id", "$$local"}},
+			}}
+		} else {
+			expr = bson.M{"$cond": bson.M{
 				"if":   bson.M{"$isArray": "$$local"},
 				"then": bson.M{"$in": bson.A{"$" + rel.ForeignKey, "$$local"}},
 				"else": bson.M{"$eq": bson.A{"$" + rel.ForeignKey, "$$local"}},
-			},
-		}}}}
+			}}
+		}
+		inner := []bson.M{{"$match": bson.M{"$expr": expr}}}
 		if len(rel.Conditions) > 0 {
 			inner = append(inner, bson.M{"$match": rel.Conditions})
 		}
@@ -1178,7 +1234,7 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 		}
 		lookup := bson.M{"$lookup": bson.M{
 			"from":     rel.Related,
-			"let":      bson.M{"local": "$" + rel.LocalKey},
+			"let":      letMap,
 			"pipeline": inner,
 			"as":       outField,
 		}}
