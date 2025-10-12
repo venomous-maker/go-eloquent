@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.0.1.1 (2025-10-12)
+## v1.0.2 (2025-10-12)
 
 Patch
 - Small fixes and adjustments to nested eager-loading handling and lookup expressions.
