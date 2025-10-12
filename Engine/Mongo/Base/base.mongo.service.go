@@ -426,15 +426,17 @@ func (e *Eloquent[T]) addRelation(parts []string, parent *Relation) {
 	if parent == nil {
 		// Top level relation
 		for i := range e.relations {
-			if e.relations[i].Name == relName {
+			if e.relations[i].Name == relName || e.relations[i].OutputField() == relName {
 				relation = &e.relations[i]
 				break
 			}
 		}
 		if relation == nil {
 			newRel := e.inferRelation(relName)
-			// attach alias if provided
-			newRel.As = relAlias
+			// attach alias if provided (override any existing alias)
+			if relAlias != "" {
+				newRel.As = relAlias
+			}
 			e.relations = append(e.relations, newRel)
 			relation = &e.relations[len(e.relations)-1]
 		} else if relAlias != "" {
@@ -453,7 +455,9 @@ func (e *Eloquent[T]) addRelation(parts []string, parent *Relation) {
 			}
 		} else {
 			newRel := e.inferRelation(relName)
-			newRel.As = relAlias
+			if relAlias != "" {
+				newRel.As = relAlias
+			}
 			parent.Nested[relName] = &newRel
 			relation = parent.Nested[relName]
 		}
@@ -467,8 +471,14 @@ func (e *Eloquent[T]) addRelation(parts []string, parent *Relation) {
 
 // inferRelation attempts to infer relationship type and config
 func (e *Eloquent[T]) inferRelation(name string) Relation {
-	// This would be enhanced based on your model definitions
-	// For now, simple heuristics
+	// Try to resolve from model-level definitions first (by name or alias)
+	if e.service != nil {
+		if rel, ok := e.service.findModelRelation(strings.TrimSpace(name)); ok {
+			return rel
+		}
+	}
+
+	// Fallback heuristics
 	modelName := e.getModelName()
 
 	relation := Relation{
@@ -1347,7 +1357,7 @@ func (e *Eloquent[T]) Restore() (int64, error) {
 
 // Query returns an Eloquent query builder
 func (s *EloquentService[T]) Query() *Eloquent[T] {
-	return &Eloquent[T]{
+	qb := &Eloquent[T]{
 		service:     s,
 		wheres:      []bson.M{},
 		orWheres:    []bson.M{},
@@ -1357,6 +1367,11 @@ func (s *EloquentService[T]) Query() *Eloquent[T] {
 		withCount:   []string{},
 		scopes:      []func(*Eloquent[T]) *Eloquent[T]{},
 	}
+	// Preload default eager relations defined on the model
+	if len(s.defaultWithTokens) > 0 {
+		qb.With(s.defaultWithTokens...)
+	}
+	return qb
 }
 
 // All returns all records (with soft delete filtering)
@@ -1806,6 +1821,10 @@ type EloquentService[T BaseModels.MongoModel] struct {
 	// Caching
 	cache           *serviceCache
 	defaultCacheTTL time.Duration
+
+	// Model-level relationship metadata
+	modelRelations    []Relation
+	defaultWithTokens []string
 }
 
 // EloquentServiceInterface defines the main service operations for a model T.
@@ -1892,6 +1911,7 @@ func NewEloquentService[T BaseModels.MongoModel](ctx context.Context, db *mongo.
 	// Define a local function to get the collection name with custom logic
 	eloquentService.CollectionName = getCollectionName(model)
 
+	// Ensure deleted_at exists and is zero time when missing
 	_, _ = eloquentService.Collection.UpdateMany(ctx, bson.M{
 		"$or": []bson.M{
 			{"deleted_at": bson.M{"$exists": false}},
@@ -1901,8 +1921,95 @@ func NewEloquentService[T BaseModels.MongoModel](ctx context.Context, db *mongo.
 		"$set": bson.M{"deleted_at": time.Time{}},
 	})
 
+	// Compile model-level relations and default with
+	eloquentService.compileModelRelations(model)
+
 	return eloquentService
 }
+
+// compileModelRelations reads model.GetRelationships and GetDefaultWith and stores them on the service
+func (s *EloquentService[T]) compileModelRelations(model T) {
+	// Reset
+	s.modelRelations = nil
+	s.defaultWithTokens = nil
+
+	// DefaultWith tokens
+	if defWith, ok := any(model).(interface{ GetDefaultWith() []string }); ok {
+		if list := defWith.GetDefaultWith(); len(list) > 0 {
+			s.defaultWithTokens = append(s.defaultWithTokens, list...)
+		}
+	}
+
+	// Relationships
+	if defRels, ok := any(model).(interface {
+		GetRelationships() []BaseModels.RelationDef
+	}); ok {
+		for _, r := range defRels.GetRelationships() {
+			conv := Relation{
+				Name: r.Name,
+				Type: mapModelRelType(r.Type),
+				Related: func() string {
+					if r.Related != "" {
+						return r.Related
+					}
+					return resolveRelatedCollection(r.Name)
+				}(),
+				ForeignKey: r.ForeignKey,
+				LocalKey:   r.LocalKey,
+				Conditions: toBsonM(r.Conditions),
+				As:         r.As,
+				Required:   r.Required,
+			}
+			if r.Pivot != nil {
+				conv.Pivot = &PivotConfig{Table: r.Pivot.Table, ForeignKey: r.Pivot.ForeignKey, RelatedKey: r.Pivot.RelatedKey, Fields: r.Pivot.Fields}
+			}
+			s.modelRelations = append(s.modelRelations, conv)
+		}
+	}
+}
+
+// toBsonM converts map[string]interface{} to bson.M safely
+func toBsonM(m map[string]interface{}) bson.M {
+	if m == nil {
+		return nil
+	}
+	res := bson.M{}
+	for k, v := range m {
+		res[k] = v
+	}
+	return res
+}
+
+// mapModelRelType converts BaseModels.RelationshipType to engine RelationType
+func mapModelRelType(t BaseModels.RelationshipType) RelationType {
+	switch t {
+	case BaseModels.RelBelongsTo:
+		return BelongsTo
+	case BaseModels.RelHasOne:
+		return HasOne
+	case BaseModels.RelHasMany:
+		return HasMany
+	case BaseModels.RelBelongsToMany:
+		return BelongsToMany
+	default:
+		return HasMany
+	}
+}
+
+// findModelRelation returns a Relation matching name or alias (case-sensitive match after trim)
+func (s *EloquentService[T]) findModelRelation(token string) (Relation, bool) {
+	name := strings.TrimSpace(token)
+	for _, r := range s.modelRelations {
+		if r.Name == name || r.OutputField() == name {
+			// return a copy to avoid accidental shared mutations
+			cpy := r
+			return cpy, true
+		}
+	}
+	return Relation{}, false
+}
+
+// ==================== Find, Update, Delete, etc. (no changes below, except where noted) ====================
 
 // Find retrieves a document by its ID.
 //
