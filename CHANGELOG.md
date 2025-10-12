@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.1.1 (2025-10-12)
+
+Patch
+- Small fixes and adjustments to nested eager-loading handling and lookup expressions.
+- Ensure aliases with dots (e.g. "cm_products.periods as products.periods") are parsed and attached correctly.
+- Support product-level supported_periods arrays to populate periods by _id.
+
+
 ## v1.0.1 (2025-10-12)
 
 Highlights
