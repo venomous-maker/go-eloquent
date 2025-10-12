@@ -19,6 +19,7 @@ Why go-eloquent
 - ⚡ Fluent query builder: Where, OrWhere, WhereIn, OrderBy, Limit, Skip, Select
 - 🧹 Soft deletes with Active, WithTrashed, OnlyTrashed scopes
 - 🔗 Eager loading and counts via aggregation (With, WithCount)
+- 🏷️ Relation field alias: attach related data under a custom field (e.g. `With("user as created_by")`)
 - 🧠 Read caching with per-collection TTL and automatic invalidation on writes
 - 🪝 Lifecycle hooks: Before/After Save, Update, Delete, Fetch
 - 🧪 Simple transactions wrapper
@@ -106,6 +107,32 @@ usersWithPosts, _ := userSvc.Query().HasMany("posts", "user_id", "_id").With("po
 usersWithRoles, _ := userSvc.Query().BelongsToMany("roles", "role_user", "user_id", "role_id").With("roles").Get()
 
 _ = posts; _ = usersWithPosts; _ = usersWithRoles
+```
+
+Attach field aliases (optional)
+- You can choose the field name where the related data attaches using the " as " alias syntax.
+- If no alias is provided, it falls back to the relation name (current behavior).
+
+Examples
+
+```go
+// Eager load with alias (result document has field created_by)
+posts, _ := postSvc.Query().With("user as created_by").Get()
+
+// BelongsTo with alias (attach under created_by)
+posts, _ = postSvc.Query().BelongsTo("user as created_by", "user_id", "_id").Get()
+
+// HasOne with alias
+users, _ := userSvc.Query().HasOne("profile as main_profile", "", "").With("main_profile").Get()
+
+// HasMany with alias
+users, _ = userSvc.Query().HasMany("comments as feedback", "", "").With("feedback").Get()
+
+// BelongsToMany with alias
+posts, _ = postSvc.Query().BelongsToMany("tags as labels", "post_tag", "post_id", "tag_id").With("labels").Get()
+
+// WithCount accepts the relation name or the alias
+posts, _ = postSvc.Query().With("comments as feedback").WithCount("feedback").Get()
 ```
 
 Caching
