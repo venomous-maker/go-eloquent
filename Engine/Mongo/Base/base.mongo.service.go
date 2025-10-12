@@ -146,15 +146,29 @@ func (r Relation) OutputField() string {
 	return r.Name
 }
 
-// sanitizeOutField ensures Mongo $lookup "as" is a simple field name without dots; falls back to fallback name
+// Improve sanitizeOutField to ensure returned field name contains no dots.
 func sanitizeOutField(name, fallback string) string {
-	if strings.TrimSpace(name) == "" {
-		return fallback
+	trimmed := strings.TrimSpace(name)
+	// If provided name is non-empty and contains no dots, use it directly
+	if trimmed != "" && !strings.Contains(trimmed, ".") {
+		return trimmed
 	}
-	if strings.Contains(name, ".") {
-		return fallback
+
+	// Normalize fallback: prefer the last segment if dotted (e.g. "a.b.c" -> "c")
+	fb := strings.TrimSpace(fallback)
+	if fb == "" {
+		return ""
 	}
-	return name
+	if strings.Contains(fb, ".") {
+		parts := strings.Split(fb, ".")
+		last := strings.TrimSpace(parts[len(parts)-1])
+		// ensure last segment has no dots
+		if last != "" && !strings.Contains(last, ".") {
+			return last
+		}
+	}
+	// fallback as-is (likely already simple)
+	return fb
 }
 
 type RelationType string
