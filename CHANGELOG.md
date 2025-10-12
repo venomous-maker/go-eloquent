@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0.0 (2025-10-12)
+## v1.0.0 (2025-10-12)
 
 Highlights
 - Model-level relationship definitions (Models/Base):
@@ -17,8 +17,7 @@ Highlights
 Notes
 - Default eager loads will be present even if With(...) isn’t called.
 - With("profile as main_profile") and With("main_profile") both work.
-- For Go modules, tags typically use vX.Y.Z; this release uses 1.0.0.0 per request.
+- Tags follow semver vX.Y.Z; this release uses v1.0.0.
 
 Upgrade
 - No breaking API changes. Existing queries continue to work; you can layer in model-level relations progressively.
-
