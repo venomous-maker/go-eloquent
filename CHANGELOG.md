@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.0.1 (2025-10-12)
+
+Highlights
+- Mongo engine nested eager-loading:
+  - Support With tokens like "products.periods" that nest $lookup inside parent lookups.
+  - Dotted aliases on nested relations are normalized (Mongo $lookup as cannot contain dots).
+  - Nested discovery works with model-level definitions (full dotted names) or child defs using dotted LocalKey.
+- Model defaults:
+  - GetDefaultWith() now preloads defaults on every Query() including nested relations when ordered correctly.
+- Alias matching:
+  - With()/WithCount() accept either relation name or its alias; HasOne/BelongsTo/HasMany/BelongsToMany accept "name as alias".
+
+
 ## v1.0.0 (2025-10-12)
 
 Highlights
