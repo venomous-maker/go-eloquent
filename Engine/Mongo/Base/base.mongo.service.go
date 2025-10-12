@@ -146,6 +146,17 @@ func (r Relation) OutputField() string {
 	return r.Name
 }
 
+// sanitizeOutField ensures Mongo $lookup "as" is a simple field name without dots; falls back to fallback name
+func sanitizeOutField(name, fallback string) string {
+	if strings.TrimSpace(name) == "" {
+		return fallback
+	}
+	if strings.Contains(name, ".") {
+		return fallback
+	}
+	return name
+}
+
 type RelationType string
 
 const (
@@ -454,7 +465,8 @@ func (e *Eloquent[T]) addRelation(parts []string, parent *Relation) {
 				relation.As = relAlias
 			}
 		} else {
-			newRel := e.inferRelation(relName)
+			// infer nested using model-level full token if available and normalize keys for nested context
+			newRel := e.inferRelationNested(relName, parent)
 			if relAlias != "" {
 				newRel.As = relAlias
 			}
@@ -503,6 +515,50 @@ func (e *Eloquent[T]) inferRelation(name string) Relation {
 	}
 
 	return relation
+}
+
+// inferRelationNested resolves a nested relation token relative to a parent relation using model definitions when possible
+func (e *Eloquent[T]) inferRelationNested(name string, parent *Relation) Relation {
+	// Try full path matches from model-level definitions
+	if e.service != nil && parent != nil {
+		if rel, ok := e.service.findModelRelationFull(parent.Name, name); ok {
+			return e.normalizeForNested(rel, *parent)
+		}
+		if rel, ok := e.service.findModelRelationFull(parent.OutputField(), name); ok {
+			return e.normalizeForNested(rel, *parent)
+		}
+		if rel, ok := e.service.findModelRelation(strings.TrimSpace(name)); ok {
+			return e.normalizeForNested(rel, *parent)
+		}
+	}
+	// Fallback to generic inference and normalize
+	r := e.inferRelation(name)
+	return e.normalizeForNested(r, *parent)
+}
+
+// normalizeForNested trims parent prefixes from child keys so they are relative to the child document inside the parent pipeline
+func (e *Eloquent[T]) normalizeForNested(child Relation, parent Relation) Relation {
+	prefixes := []string{}
+	if parent.Name != "" {
+		prefixes = append(prefixes, parent.Name+".")
+	}
+	if of := parent.OutputField(); of != "" {
+		prefixes = append(prefixes, of+".")
+	}
+	if parent.Related != "" {
+		prefixes = append(prefixes, parent.Related+".")
+	}
+	strip := func(s string) string {
+		for _, p := range prefixes {
+			if strings.HasPrefix(s, p) {
+				return strings.TrimPrefix(s, p)
+			}
+		}
+		return s
+	}
+	child.LocalKey = strip(child.LocalKey)
+	child.ForeignKey = strip(child.ForeignKey)
+	return child
 }
 
 // getModelName gets the current model name
@@ -976,73 +1032,155 @@ func (e *Eloquent[T]) buildAggregationPipeline() []bson.M {
 	return pipeline
 }
 
-// buildLookupStage builds lookup stages for a relationship (with conditions support)
-func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
+// buildNestedLookupStages builds lookup stages relative to a parent relation's inner pipeline document
+func (e *Eloquent[T]) buildNestedLookupStages(child Relation) []bson.M {
 	stages := []bson.M{}
-	outField := rel.OutputField()
-
-	switch rel.Type {
+	outField := sanitizeOutField(child.OutputField(), child.Name)
+	switch child.Type {
 	case BelongsTo:
-		// parent holds foreignKey referencing related localKey (default _id)
 		lookup := bson.M{"$lookup": bson.M{
-			"from": rel.Related,
-			"let":  bson.M{"fk": "$" + rel.ForeignKey},
+			"from": child.Related,
+			"let":  bson.M{"fk": "$" + child.ForeignKey},
 			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
 				"$cond": bson.M{
 					"if":   bson.M{"$isArray": "$$fk"},
-					"then": bson.M{"$in": bson.A{"$" + rel.LocalKey, "$$fk"}},
-					"else": bson.M{"$eq": bson.A{"$" + rel.LocalKey, "$$fk"}},
+					"then": bson.M{"$in": bson.A{"$" + child.LocalKey, "$$fk"}},
+					"else": bson.M{"$eq": bson.A{"$" + child.LocalKey, "$$fk"}},
 				},
 			}}}},
 				func() []bson.M {
-					if len(rel.Conditions) > 0 {
-						return []bson.M{{"$match": rel.Conditions}}
+					if len(child.Conditions) > 0 {
+						return []bson.M{{"$match": child.Conditions}}
 					}
 					return nil
 				}()...),
 			"as": outField,
+		}}
+		stages = append(stages, lookup)
+		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !child.Required}})
+	case HasOne:
+		lookup := bson.M{"$lookup": bson.M{
+			"from": child.Related,
+			"let":  bson.M{"local": "$" + child.LocalKey},
+			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
+				"$cond": bson.M{
+					"if":   bson.M{"$isArray": "$$local"},
+					"then": bson.M{"$in": bson.A{"$" + child.ForeignKey, "$$local"}},
+					"else": bson.M{"$eq": bson.A{"$" + child.ForeignKey, "$$local"}},
+				},
+			}}}},
+				func() []bson.M {
+					if len(child.Conditions) > 0 {
+						return []bson.M{{"$match": child.Conditions}}
+					}
+					return nil
+				}()...),
+			"as": outField,
+		}}
+		stages = append(stages, lookup)
+		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !child.Required}})
+	case HasMany:
+		lookup := bson.M{"$lookup": bson.M{
+			"from": child.Related,
+			"let":  bson.M{"local": "$" + child.LocalKey},
+			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
+				"$cond": bson.M{
+					"if":   bson.M{"$isArray": "$$local"},
+					"then": bson.M{"$in": bson.A{"$" + child.ForeignKey, "$$local"}},
+					"else": bson.M{"$eq": bson.A{"$" + child.ForeignKey, "$$local"}},
+				},
+			}}}},
+				func() []bson.M {
+					if len(child.Conditions) > 0 {
+						return []bson.M{{"$match": child.Conditions}}
+					}
+					return nil
+				}()...),
+			"as": outField,
+		}}
+		stages = append(stages, lookup)
+		if child.Required {
+			stages = append(stages, bson.M{"$match": bson.M{"$expr": bson.M{"$gt": bson.A{bson.M{"$size": "$" + outField}, 0}}}})
+		}
+	}
+	return stages
+}
+
+// buildLookupStage builds lookup stages for a relationship (with conditions support)
+func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
+	stages := []bson.M{}
+	outField := sanitizeOutField(rel.OutputField(), rel.Name)
+
+	switch rel.Type {
+	case BelongsTo:
+		inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
+			"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$fk"},
+				"then": bson.M{"$in": bson.A{"$" + rel.LocalKey, "$$fk"}},
+				"else": bson.M{"$eq": bson.A{"$" + rel.LocalKey, "$$fk"}},
+			},
+		}}}}
+		if len(rel.Conditions) > 0 {
+			inner = append(inner, bson.M{"$match": rel.Conditions})
+		}
+		if len(rel.Nested) > 0 {
+			for _, child := range rel.Nested {
+				inner = append(inner, e.buildNestedLookupStages(*child)...)
+			}
+		}
+		lookup := bson.M{"$lookup": bson.M{
+			"from":     rel.Related,
+			"let":      bson.M{"fk": "$" + rel.ForeignKey},
+			"pipeline": inner,
+			"as":       outField,
 		}}
 		stages = append(stages, lookup)
 		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !rel.Required}})
 	case HasOne:
+		inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
+			"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$local"},
+				"then": bson.M{"$in": bson.A{"$" + rel.ForeignKey, "$$local"}},
+				"else": bson.M{"$eq": bson.A{"$" + rel.ForeignKey, "$$local"}},
+			},
+		}}}}
+		if len(rel.Conditions) > 0 {
+			inner = append(inner, bson.M{"$match": rel.Conditions})
+		}
+		if len(rel.Nested) > 0 {
+			for _, child := range rel.Nested {
+				inner = append(inner, e.buildNestedLookupStages(*child)...)
+			}
+		}
 		lookup := bson.M{"$lookup": bson.M{
-			"from": rel.Related,
-			"let":  bson.M{"local": "$" + rel.LocalKey},
-			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-				"$cond": bson.M{
-					"if":   bson.M{"$isArray": "$$local"},
-					"then": bson.M{"$in": bson.A{"$" + rel.ForeignKey, "$$local"}},
-					"else": bson.M{"$eq": bson.A{"$" + rel.ForeignKey, "$$local"}},
-				},
-			}}}},
-				func() []bson.M {
-					if len(rel.Conditions) > 0 {
-						return []bson.M{{"$match": rel.Conditions}}
-					}
-					return nil
-				}()...),
-			"as": outField,
+			"from":     rel.Related,
+			"let":      bson.M{"local": "$" + rel.LocalKey},
+			"pipeline": inner,
+			"as":       outField,
 		}}
 		stages = append(stages, lookup)
 		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !rel.Required}})
 	case HasMany:
+		inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
+			"$cond": bson.M{
+				"if":   bson.M{"$isArray": "$$local"},
+				"then": bson.M{"$in": bson.A{"$" + rel.ForeignKey, "$$local"}},
+				"else": bson.M{"$eq": bson.A{"$" + rel.ForeignKey, "$$local"}},
+			},
+		}}}}
+		if len(rel.Conditions) > 0 {
+			inner = append(inner, bson.M{"$match": rel.Conditions})
+		}
+		if len(rel.Nested) > 0 {
+			for _, child := range rel.Nested {
+				inner = append(inner, e.buildNestedLookupStages(*child)...)
+			}
+		}
 		lookup := bson.M{"$lookup": bson.M{
-			"from": rel.Related,
-			"let":  bson.M{"local": "$" + rel.LocalKey},
-			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-				"$cond": bson.M{
-					"if":   bson.M{"$isArray": "$$local"},
-					"then": bson.M{"$in": bson.A{"$" + rel.ForeignKey, "$$local"}},
-					"else": bson.M{"$eq": bson.A{"$" + rel.ForeignKey, "$$local"}},
-				},
-			}}}},
-				func() []bson.M {
-					if len(rel.Conditions) > 0 {
-						return []bson.M{{"$match": rel.Conditions}}
-					}
-					return nil
-				}()...),
-			"as": outField,
+			"from":     rel.Related,
+			"let":      bson.M{"local": "$" + rel.LocalKey},
+			"pipeline": inner,
+			"as":       outField,
 		}}
 		stages = append(stages, lookup)
 		if rel.Required {
@@ -1050,7 +1188,6 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 		}
 	case BelongsToMany:
 		if rel.Pivot != nil {
-			// pivot lookup
 			pivotField := outField + "_pivot"
 			pivotLookup := bson.M{"$lookup": bson.M{
 				"from":         rel.Pivot.Table,
@@ -1059,18 +1196,20 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 				"as":           pivotField,
 			}}
 			stages = append(stages, pivotLookup)
-			// related lookup using pipeline for conditions
+			inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{"$in": bson.A{"$_id", "$" + pivotField + "." + rel.Pivot.RelatedKey}}}}}
+			if len(rel.Conditions) > 0 {
+				inner = append(inner, bson.M{"$match": rel.Conditions})
+			}
+			if len(rel.Nested) > 0 {
+				for _, child := range rel.Nested {
+					inner = append(inner, e.buildNestedLookupStages(*child)...)
+				}
+			}
 			relatedLookup := bson.M{"$lookup": bson.M{
-				"from": rel.Related,
-				"let":  bson.M{"relIds": "$" + pivotField + "." + rel.Pivot.RelatedKey},
-				"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{"$in": bson.A{"$_id", "$$relIds"}}}}},
-					func() []bson.M {
-						if len(rel.Conditions) > 0 {
-							return []bson.M{{"$match": rel.Conditions}}
-						}
-						return nil
-					}()...),
-				"as": outField,
+				"from":     rel.Related,
+				"let":      bson.M{},
+				"pipeline": inner,
+				"as":       outField,
 			}}
 			stages = append(stages, relatedLookup)
 			if rel.Required {
@@ -2009,15 +2148,7 @@ func (s *EloquentService[T]) findModelRelation(token string) (Relation, bool) {
 	return Relation{}, false
 }
 
-// ==================== Find, Update, Delete, etc. (no changes below, except where noted) ====================
-
 // Find retrieves a document by its ID.
-//
-// It converts the provided string ID to a primitive.ObjectID and searches for a document
-// with the matching "_id" and a "deleted_at" field set to the zero time value, indicating
-// that the document is active.
-//
-// Returns the document if found, or an error if the ID is invalid or the document is not found.
 func (s *EloquentService[T]) Find(id string) (T, error) {
 	var zero T
 	objID, err := primitive.ObjectIDFromHex(id)
@@ -2135,21 +2266,6 @@ func (s *EloquentService[T]) Delete(id string) error {
 	return err
 }
 
-// Restore a soft deleted document
-func (s *EloquentService[T]) Restore(id string) error {
-	objID, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		return err
-	}
-	_, err = s.Collection.UpdateOne(s.Ctx, bson.M{"_id": objID}, bson.M{"$set": bson.M{"deleted_at": time.Time{}}})
-	if err == nil {
-		if s.cache != nil {
-			s.cache.invalidateCollection(s.CollectionName)
-		}
-	}
-	return err
-}
-
 // ForceDelete hard deletes a document by ID
 func (s *EloquentService[T]) ForceDelete(id string) error {
 	if s.BeforeDelete != nil {
@@ -2168,6 +2284,21 @@ func (s *EloquentService[T]) ForceDelete(id string) error {
 		}
 		if s.AfterDelete != nil {
 			_ = s.AfterDelete(id)
+		}
+	}
+	return err
+}
+
+// Restore a soft deleted document
+func (s *EloquentService[T]) Restore(id string) error {
+	objID, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		return err
+	}
+	_, err = s.Collection.UpdateOne(s.Ctx, bson.M{"_id": objID}, bson.M{"$set": bson.M{"deleted_at": time.Time{}}})
+	if err == nil {
+		if s.cache != nil {
+			s.cache.invalidateCollection(s.CollectionName)
 		}
 	}
 	return err
@@ -2366,4 +2497,16 @@ func (s *EloquentService[T]) FromJson(model *T, data map[string]interface{}) err
 		return err
 	}
 	return json.Unmarshal(bytes, model)
+}
+
+// findModelRelationFull returns a Relation matching a full dotted token like "parent.child"
+func (s *EloquentService[T]) findModelRelationFull(parentName, childName string) (Relation, bool) {
+	full := strings.TrimSpace(parentName) + "." + strings.TrimSpace(childName)
+	for _, r := range s.modelRelations {
+		if r.Name == full || r.OutputField() == full {
+			cpy := r
+			return cpy, true
+		}
+	}
+	return Relation{}, false
 }
