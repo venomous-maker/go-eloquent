@@ -6,6 +6,7 @@ Patch
 - Small fixes and adjustments to nested eager-loading handling and lookup expressions.
 - Ensure aliases with dots (e.g. "cm_products.periods as products.periods") are parsed and attached correctly.
 - Support product-level supported_periods arrays to populate periods by _id.
+- Flatten grandchild lookups for array children (e.g., products.benefits -> categories via benefit_category_id) so you can attach categories at product level using alias ("cm_products.cm_product_benefits.cm_product_benefit_categories as categories").
 
 
 ## v1.0.1 (2025-10-12)

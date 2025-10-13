@@ -512,19 +512,29 @@ func (e *Eloquent[T]) inferRelation(name string) Relation {
 		Related: resolveRelatedCollection(name),
 	}
 
-	// Simple heuristics for relationship types
+	lower := strings.ToLower(name)
+	// Helper to detect simple plural form (very small heuristic)
+	isPlural := func(s string) bool {
+		s = strings.ToLower(s)
+		return strings.HasSuffix(s, "s") || strings.HasSuffix(s, "es")
+	}
+
+	// If token explicitly looks like a foreign key (ends with _id or Id), treat as BelongsTo
 	if strings.HasSuffix(name, "_id") || strings.HasSuffix(name, "Id") {
 		relation.Type = BelongsTo
 		relation.ForeignKey = name
 		relation.LocalKey = "_id"
-	} else if strlib.ConvertToSnakeCase(name) == strings.ToLower(modelName) {
+		return relation
+	}
+
+	// If token is plural, assume HasMany; otherwise assume BelongsTo (singular)
+	if isPlural(lower) {
 		relation.Type = HasMany
 		relation.ForeignKey = strlib.ConvertToSnakeCase(modelName) + "_id"
 		relation.LocalKey = "_id"
 	} else {
-		// Default to hasMany
-		relation.Type = HasMany
-		relation.ForeignKey = strlib.ConvertToSnakeCase(modelName) + "_id"
+		relation.Type = BelongsTo
+		relation.ForeignKey = strlib.ConvertToSnakeCase(name) + "_id"
 		relation.LocalKey = "_id"
 	}
 
@@ -2149,12 +2159,36 @@ func mapModelRelType(t BaseModels.RelationshipType) RelationType {
 	}
 }
 
-// findModelRelation returns a Relation matching name or alias (case-sensitive match after trim)
+// findModelRelation returns a Relation matching name or alias (case-insensitive, permissive)
 func (s *EloquentService[T]) findModelRelation(token string) (Relation, bool) {
 	name := strings.TrimSpace(token)
+	if name == "" {
+		return Relation{}, false
+	}
+	lowerName := strings.ToLower(name)
+
 	for _, r := range s.modelRelations {
-		if r.Name == name || r.OutputField() == name {
-			// return a copy to avoid accidental shared mutations
+		// prepare comparison variants
+		rName := strings.ToLower(strings.TrimSpace(r.Name))
+		rOut := strings.ToLower(strings.TrimSpace(r.OutputField()))
+		rRelated := strings.ToLower(strings.TrimSpace(r.Related))
+
+		// last segment of dotted relation name (e.g., "cm_products.periods" -> "periods")
+		rNameLast := rName
+		if idx := strings.LastIndex(rName, "."); idx != -1 && idx+1 < len(rName) {
+			rNameLast = rName[idx+1:]
+		}
+		// last segment of output field as well
+		rOutLast := rOut
+		if idx := strings.LastIndex(rOut, "."); idx != -1 && idx+1 < len(rOut) {
+			rOutLast = rOut[idx+1:]
+		}
+
+		// also consider snake_case/pluralized forms of the token for matching against Related
+		snake := strings.ToLower(strlib.ConvertToSnakeCase(name))
+		plural := strings.ToLower(strlib.Pluralize(strlib.ConvertToSnakeCase(name)))
+
+		if lowerName == rName || lowerName == rOut || lowerName == rRelated || lowerName == rNameLast || lowerName == rOutLast || lowerName == snake || lowerName == plural {
 			cpy := r
 			return cpy, true
 		}
@@ -2516,8 +2550,16 @@ func (s *EloquentService[T]) FromJson(model *T, data map[string]interface{}) err
 // findModelRelationFull returns a Relation matching a full dotted token like "parent.child"
 func (s *EloquentService[T]) findModelRelationFull(parentName, childName string) (Relation, bool) {
 	full := strings.TrimSpace(parentName) + "." + strings.TrimSpace(childName)
+	fullLower := strings.ToLower(full)
 	for _, r := range s.modelRelations {
-		if r.Name == full || r.OutputField() == full {
+		rName := strings.ToLower(r.Name)
+		rOut := strings.ToLower(r.OutputField())
+		if rName == fullLower || rOut == fullLower {
+			cpy := r
+			return cpy, true
+		}
+		// Also allow suffix match so definitions like "root.parent.child" match when searching "parent.child"
+		if strings.HasSuffix(strings.ToLower(r.Name), "."+fullLower) || strings.HasSuffix(strings.ToLower(r.OutputField()), "."+fullLower) {
 			cpy := r
 			return cpy, true
 		}
