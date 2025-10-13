@@ -1852,7 +1852,7 @@ func (s *EloquentService[T]) CreateOrUpdate(model T) (T, error) {
 
 	// Check if document exists
 	existing, err := s.Find(model.GetID().Hex())
-	if err != nil && err != mongo.ErrNoDocuments {
+	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
 		return model, err
 	}
 
