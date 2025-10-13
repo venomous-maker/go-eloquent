@@ -822,15 +822,22 @@ func (e *Eloquent[T]) cacheTTLOrDefault() time.Duration {
 // buildCacheKey constructs a stable cache key for the current query
 func (e *Eloquent[T]) buildCacheKey(filter bson.M, isAggregate bool) string {
 	keyObj := bson.M{
-		"collection": e.service.CollectionName,
-		"filter":     filter,
-		"orders":     e.orders,
-		"select":     e.selectFields,
-		"limit":      e.limitNum,
-		"skip":       e.skipNum,
-		"relations":  e.relations,
-		"withCount":  e.withCount,
-		"aggregate":  isAggregate,
+		"collection":                e.service.CollectionName,
+		"filter":                    filter,
+		"orders":                    e.orders,
+		"select":                    e.selectFields,
+		"limit":                     e.limitNum,
+		"skip":                      e.skipNum,
+		"relations":                 e.relations,
+		"withCount":                 e.withCount,
+		"aggregate":                 isAggregate,
+		"scopes":                    e.scopes,
+		"aggregates":                e.aggregates,
+		"whereHasConditions":        e.whereHasConditions,
+		"whereDoesntHaveConditions": e.whereDoesntHaveConditions,
+		"limitNum":                  e.limitNum,
+		"skipNum":                   e.skipNum,
+		"cacheTTL":                  e.cacheTTLOrDefault(),
 	}
 	bytes, _ := bson.Marshal(keyObj)
 	sum := sha256.Sum256(bytes)
@@ -1980,14 +1987,20 @@ func (e *Eloquent[T]) Restore() (int64, error) {
 // Query returns an Eloquent query builder
 func (s *EloquentService[T]) Query() *Eloquent[T] {
 	qb := &Eloquent[T]{
-		service:     s,
-		wheres:      []bson.M{},
-		orWheres:    []bson.M{},
-		whereIns:    make(map[string][]interface{}),
-		whereNotIns: make(map[string][]interface{}),
-		relations:   []Relation{},
-		withCount:   []string{},
-		scopes:      []func(*Eloquent[T]) *Eloquent[T]{},
+		service:                   s,
+		wheres:                    []bson.M{},
+		orWheres:                  []bson.M{},
+		whereIns:                  make(map[string][]interface{}),
+		whereNotIns:               make(map[string][]interface{}),
+		relations:                 []Relation{},
+		withCount:                 []string{},
+		scopes:                    []func(*Eloquent[T]) *Eloquent[T]{},
+		aggregates:                []Aggregate{},
+		whereHasConditions:        make(map[string][]bson.M),
+		whereDoesntHaveConditions: make(map[string][]bson.M),
+		limitNum:                  nil,
+		skipNum:                   nil,
+		cacheTTL:                  nil,
 	}
 	// Preload default eager relations defined on the model
 	if len(s.defaultWithTokens) > 0 {
