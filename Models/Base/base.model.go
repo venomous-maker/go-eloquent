@@ -71,6 +71,10 @@ type MongoModel interface {
 	GetRelationships() []RelationDef
 	// Default relations to eager load by name or "name as alias" tokens. BaseModel provides empty default.
 	GetDefaultWith() []string
+	SetTimestampsOnUpdate()
+	SoftDelete()
+	Restore()
+	IsSoftDeleted() bool
 }
 
 func (b *BaseModel) GetID() primitive.ObjectID {
@@ -142,4 +146,59 @@ func (b *BaseModel) GetRelationships() []RelationDef {
 // GetDefaultWith returns relation tokens that should be eager-loaded by default. Default: none.
 func (b *BaseModel) GetDefaultWith() []string {
 	return nil
+}
+
+// Add these helper methods to BaseModel
+func (b *BaseModel) SetTimestampsOnUpdate() {
+	b.UpdatedAt = time.Now()
+}
+
+// SoftDelete sets deleted_at and updated_at timestamps, marking the model as soft-deleted.
+//
+// It is a part of the MongoModel interface.
+//
+// Parameters: None
+//
+// Returns:
+// None
+//
+// Notes:
+// - SoftDelete does not delete the model from the database.
+// - SoftDelete sets deleted_at and updated_at timestamps.
+func (b *BaseModel) SoftDelete() {
+	now := time.Now()
+	b.DeletedAt = now
+	b.UpdatedAt = now
+}
+
+// Restore sets deleted_at to zero time and updated_at to the current time, marking the model as restored.
+//
+// It is a part of the MongoModel interface.
+//
+// Parameters: None
+//
+// Returns:
+// None
+//
+// Notes:
+// - Restore does not delete the model from the database.
+// - Restore sets deleted_at to zero time and updated_at to the current time.
+func (b *BaseModel) Restore() {
+	b.DeletedAt = time.Time{}
+	b.UpdatedAt = time.Now()
+}
+
+// IsSoftDeleted checks if the model has been soft deleted.
+//
+// It is a part of the MongoModel interface.
+//
+// Parameters: None
+//
+// Returns:
+// True if the model has been soft deleted, false otherwise.
+//
+// Notes:
+// - IsSoftDeleted checks if the deleted_at timestamp is not zero time.
+func (b *BaseModel) IsSoftDeleted() bool {
+	return b.DeletedAt != time.Time{} && !b.DeletedAt.IsZero()
 }
