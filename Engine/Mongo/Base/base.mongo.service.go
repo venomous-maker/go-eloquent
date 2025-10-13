@@ -2112,7 +2112,7 @@ func (s *EloquentService[T]) UpdateOrCreate(conditions bson.M, model T) (T, erro
 	qb := s.Query().WhereMap(conditions)
 	result, err := qb.First()
 
-	if err == mongo.ErrNoDocuments {
+	if errors.Is(err, mongo.ErrNoDocuments) {
 		// Create new record - merge conditions and updates
 		createData := make(bson.M)
 		for k, v := range conditions {
@@ -2166,12 +2166,10 @@ func (s *EloquentService[T]) CreateOrUpdate(model T) (T, error) {
 	delete(doc, "_id")
 
 	// Preserve original timestamps
-	{ // Document exists
+	if existing != nil { // Document exists
 		doc["created_at"] = existing.GetCreatedAt()
 		if existing.GetDeletedAt() != (time.Time{}) {
 			doc["deleted_at"] = existing.GetDeletedAt()
-		} else {
-			delete(doc, "deleted_at")
 		}
 	}
 
