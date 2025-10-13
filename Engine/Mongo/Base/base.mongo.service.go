@@ -2166,7 +2166,7 @@ func (s *EloquentService[T]) CreateOrUpdate(model T) (T, error) {
 	delete(doc, "_id")
 
 	// Preserve original timestamps
-	if existing != nil { // Document exists
+	if !existing.GetID().IsZero() { // Document exists
 		doc["created_at"] = existing.GetCreatedAt()
 		if existing.GetDeletedAt() != (time.Time{}) {
 			doc["deleted_at"] = existing.GetDeletedAt()
