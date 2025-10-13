@@ -2152,8 +2152,12 @@ func (s *EloquentService[T]) CreateOrUpdate(model T) (T, error) {
 
 	// Check if document exists
 	existing, err := s.Find(model.GetID().Hex())
-	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		return model, err
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return s.Save(model)
+		} else {
+			return model, err
+		}
 	}
 
 	// Convert model to bson
@@ -2165,43 +2169,10 @@ func (s *EloquentService[T]) CreateOrUpdate(model T) (T, error) {
 	// Remove _id to avoid immutable field update
 	delete(doc, "_id")
 
-	// Preserve original timestamps
-	if !existing.GetID().IsZero() { // Document exists
-		doc["created_at"] = existing.GetCreatedAt()
-		if existing.GetDeletedAt() != (time.Time{}) {
-			doc["deleted_at"] = existing.GetDeletedAt()
-		}
-	}
-
-	// Always update the updated_at timestamp
-	doc["updated_at"] = time.Now()
-
-	// BeforeSave hook
-	if s.BeforeSave != nil {
-		if err := s.BeforeSave(model); err != nil {
-			return model, err
-		}
-	}
-
-	// Perform upsert
-	_, err = s.Collection.UpdateOne(
-		s.Ctx,
-		bson.M{"_id": model.GetID()},
-		bson.M{"$set": doc},
-		options.Update().SetUpsert(true),
-	)
+	// Update existing record
+	_, err = s.Query().Where("_id", existing.GetID()).Update(doc)
 	if err != nil {
 		return model, err
-	}
-
-	// Invalidate cache
-	if s.cache != nil {
-		s.cache.invalidateCollection(s.CollectionName)
-	}
-
-	// AfterUpdate hook
-	if s.AfterUpdate != nil {
-		_ = s.AfterUpdate(model)
 	}
 
 	// Return the fresh model
