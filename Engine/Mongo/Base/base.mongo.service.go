@@ -1052,30 +1052,7 @@ func (e *Eloquent[T]) getWithRelations() ([]T, error) {
 	return results, nil
 }
 
-// getWithRelations returns all records with eager loaded relations.
-// It uses the aggregation pipeline to lookup related documents.
-// Relations are defined in the Eloquent struct using the Relations field.
-// The relations can be of type HasOne, BelongsTo, HasMany, BelongsToMany.
-// The service will automatically detect the relation type and build the correct aggregation pipeline.
-// The pipeline is built in the following order:
-// 1. Match stage: filters out records that don't match the filter defined in the Eloquent struct.
-// 2. Lookup stages: for each relation, a lookup stage is added to the pipeline that fetches the related documents.
-// The lookup stages are added in the order they are defined in the Eloquent struct.
-// The output of the lookup stage is added to the root document with the field name being the relation name.
-// For array relations (HasMany, BelongsToMany), a count of the related documents is added to the root document with the field name being the relation name + "_count".
-// The count is only added if the WithCount field of the Eloquent struct contains the relation name.
-// The WithCount field allows to specify which array relations should have their count added to the root document.
-// The returned documents will have the following structure:
-//
-//	{
-//		"field1": "value1",
-//		"field2": "value2",
-//		"relation1": [...],
-//		"relation1_count": 3,
-//		"relation2": [...],
-//	}
-//
-// The _count field is only added if the relation is an array relation and if the relation name is present in the WithCount field of the Eloquent struct.
+// buildAggregationPipeline builds MongoDB aggregation pipeline with relationship filters and aggregates
 func (e *Eloquent[T]) buildAggregationPipeline() []bson.M {
 	pipeline := []bson.M{}
 
@@ -1090,7 +1067,22 @@ func (e *Eloquent[T]) buildAggregationPipeline() []bson.M {
 		pipeline = append(pipeline, e.buildLookupStage(rel)...)
 	}
 
-	// withCount (only for array relations, e.g., hasMany / belongsToMany)
+	// Handle WhereHas conditions
+	if len(e.whereHasConditions) > 0 {
+		pipeline = append(pipeline, e.buildWhereHasStages()...)
+	}
+
+	// Handle WhereDoesntHave conditions
+	if len(e.whereDoesntHaveConditions) > 0 {
+		pipeline = append(pipeline, e.buildWhereDoesntHaveStages()...)
+	}
+
+	// Handle aggregates (withCount, withSum, etc.)
+	if len(e.aggregates) > 0 {
+		pipeline = append(pipeline, e.buildAggregateStages()...)
+	}
+
+	// Handle withCount (legacy - for backward compatibility)
 	if len(e.withCount) > 0 {
 		countSet := map[string]struct{}{}
 		for _, name := range e.withCount {
@@ -1098,11 +1090,10 @@ func (e *Eloquent[T]) buildAggregationPipeline() []bson.M {
 		}
 		addFields := bson.M{}
 		for _, rel := range e.relations {
-			// allow either the original relation name or the alias to be referenced in WithCount
 			_, okBase := countSet[rel.Name]
 			_, okAlias := countSet[rel.OutputField()]
 			if okBase || okAlias {
-				if rel.Type == HasMany || rel.Type == BelongsToMany { // arrays
+				if rel.Type == HasMany || rel.Type == BelongsToMany {
 					field := rel.OutputField()
 					addFields[field+"_count"] = bson.M{"$size": bson.M{"$ifNull": []interface{}{"$" + field, []interface{}{}}}}
 				}
@@ -1127,6 +1118,274 @@ func (e *Eloquent[T]) buildAggregationPipeline() []bson.M {
 	}
 
 	return pipeline
+}
+
+// buildWhereHasStages builds MongoDB aggregation pipeline stages for WhereHas conditions.
+//
+// The function takes the WhereHas conditions map and returns a slice of MongoDB
+// aggregation pipeline stages.
+//
+// The function builds a match condition based on the relation type:
+//   - For single relations (HasOne, BelongsTo), the condition checks that the relation exists and matches conditions.
+//   - For array relations (HasMany, BelongsToMany), the condition checks that the relation contains at least one matching element.
+//
+// The function returns a slice of MongoDB aggregation pipeline stages that can be appended
+// to the pipeline returned by buildAggregationPipeline.
+func (e *Eloquent[T]) buildWhereHasStages() []bson.M {
+	stages := []bson.M{}
+
+	for relation, conditions := range e.whereHasConditions {
+		// Find the relation definition
+		var relDef *Relation
+		for i := range e.relations {
+			if e.relations[i].Name == relation || e.relations[i].OutputField() == relation {
+				relDef = &e.relations[i]
+				break
+			}
+		}
+
+		if relDef == nil {
+			continue
+		}
+
+		// Build match condition based on relation type
+		outputField := relDef.OutputField()
+
+		for _, condition := range conditions {
+			matchStage := bson.M{}
+
+			switch relDef.Type {
+			case HasOne, BelongsTo:
+				// For single relations, check that the relation exists and matches conditions
+				matchStage[outputField] = bson.M{"$ne": nil}
+				// Add additional field-level conditions if any
+				if len(condition) > 0 {
+					for field, value := range condition {
+						matchStage[outputField+"."+field] = value
+					}
+				}
+
+			case HasMany, BelongsToMany:
+				// For array relations, check that array is not empty and matches conditions
+				if len(condition) == 0 {
+					// Simple existence check
+					matchStage[outputField] = bson.M{"$ne": bson.A{}}
+				} else {
+					// Complex condition - use $elemMatch
+					matchStage[outputField] = bson.M{
+						"$elemMatch": condition,
+					}
+				}
+			}
+
+			if len(matchStage) > 0 {
+				stages = append(stages, bson.M{"$match": matchStage})
+			}
+		}
+	}
+
+	return stages
+}
+
+// buildWhereDoesntHaveStages builds MongoDB aggregation pipeline stages for WhereDoesntHave conditions.
+//
+// The function takes the WhereDoesntHave conditions map and returns a slice of MongoDB
+// aggregation pipeline stages.
+//
+// The function builds a match condition based on the relation type:
+//   - For single relations (HasOne, BelongsTo), the condition checks that the relation doesn't exist OR doesn't match conditions.
+//   - For array relations (HasMany, BelongsToMany), the condition checks that the relation is empty OR doesn't contain any matching elements.
+//
+// The function returns a slice of MongoDB aggregation pipeline stages that can be appended
+// to the pipeline returned by buildAggregationPipeline.
+func (e *Eloquent[T]) buildWhereDoesntHaveStages() []bson.M {
+	stages := []bson.M{}
+
+	for relation, conditions := range e.whereDoesntHaveConditions {
+		// Find the relation definition
+		var relDef *Relation
+		for i := range e.relations {
+			if e.relations[i].Name == relation || e.relations[i].OutputField() == relation {
+				relDef = &e.relations[i]
+				break
+			}
+		}
+
+		if relDef == nil {
+			continue
+		}
+
+		// Build match condition based on relation type
+		outputField := relDef.OutputField()
+
+		for _, condition := range conditions {
+			matchStage := bson.M{}
+
+			switch relDef.Type {
+			case HasOne, BelongsTo:
+				// For single relations, check that relation doesn't exist OR doesn't match conditions
+				if len(condition) == 0 {
+					matchStage["$or"] = []bson.M{
+						{outputField: nil},
+						{outputField: bson.M{"$exists": false}},
+					}
+				} else {
+					// Complex condition - use $or with multiple cases
+					orConditions := []bson.M{
+						{outputField: nil},
+						{outputField: bson.M{"$exists": false}},
+					}
+
+					// Add condition for fields not matching
+					notMatch := bson.M{}
+					for field, value := range condition {
+						notMatch[outputField+"."+field] = bson.M{"$ne": value}
+					}
+					if len(notMatch) > 0 {
+						orConditions = append(orConditions, notMatch)
+					}
+
+					matchStage["$or"] = orConditions
+				}
+
+			case HasMany, BelongsToMany:
+				// For array relations, check that array is empty OR no elements match conditions
+				if len(condition) == 0 {
+					// Simple non-existence check
+					matchStage["$or"] = []bson.M{
+						{outputField: bson.M{"$eq": bson.A{}}},
+						{outputField: nil},
+						{outputField: bson.M{"$exists": false}},
+					}
+				} else {
+					// Complex condition - use $not with $elemMatch
+					matchStage[outputField] = bson.M{
+						"$not": bson.M{
+							"$elemMatch": condition,
+						},
+					}
+				}
+			}
+
+			if len(matchStage) > 0 {
+				stages = append(stages, bson.M{"$match": matchStage})
+			}
+		}
+	}
+
+	return stages
+}
+
+// buildAggregateStages builds MongoDB aggregation pipeline stages for aggregation functions.
+//
+// The function takes the Aggregates slice and returns a slice of MongoDB aggregation pipeline stages.
+//
+// The function builds an aggregation expression based on the relation type:
+//   - For single relations (HasOne, BelongsTo), the expression counts the number of related documents.
+//   - For array relations (HasMany, BelongsToMany), the expression counts the number of related documents that match the specified column.
+//
+// The function returns a slice of MongoDB aggregation pipeline stages that can be appended
+// to the pipeline returned by buildAggregationPipeline.
+func (e *Eloquent[T]) buildAggregateStages() []bson.M {
+	stages := []bson.M{}
+	addFields := bson.M{}
+
+	for _, agg := range e.aggregates {
+		// Find the relation definition
+		var relDef *Relation
+		for i := range e.relations {
+			if e.relations[i].Name == agg.Relation || e.relations[i].OutputField() == agg.Relation {
+				relDef = &e.relations[i]
+				break
+			}
+		}
+
+		if relDef == nil {
+			continue
+		}
+
+		outputField := relDef.OutputField()
+		var aggExpression interface{}
+
+		switch agg.Function {
+		case AggregateCount:
+			// Count the number of related documents
+			aggExpression = bson.M{"$size": bson.M{"$ifNull": []interface{}{"$" + outputField, []interface{}{}}}}
+
+		case AggregateSum:
+			// Sum a specific field across related documents
+			if agg.Column == "" {
+				// If no column specified, count instead
+				aggExpression = bson.M{"$size": bson.M{"$ifNull": []interface{}{"$" + outputField, []interface{}{}}}}
+			} else {
+				aggExpression = bson.M{"$sum": bson.M{
+					"$map": bson.M{
+						"input": bson.M{"$ifNull": []interface{}{"$" + outputField, []interface{}{}}},
+						"as":    "item",
+						"in":    "$$item." + agg.Column,
+					},
+				}}
+			}
+
+		case AggregateAvg:
+			if agg.Column == "" {
+				// If no column specified, calculate average of 1s (equivalent to count)
+				aggExpression = bson.M{"$avg": bson.M{
+					"$map": bson.M{
+						"input": bson.M{"$ifNull": []interface{}{"$" + outputField, []interface{}{}}},
+						"as":    "item",
+						"in":    1,
+					},
+				}}
+			} else {
+				aggExpression = bson.M{"$avg": bson.M{
+					"$map": bson.M{
+						"input": bson.M{"$ifNull": []interface{}{"$" + outputField, []interface{}{}}},
+						"as":    "item",
+						"in":    "$$item." + agg.Column,
+					},
+				}}
+			}
+
+		case AggregateMax:
+			if agg.Column == "" {
+				// If no column specified, use count as max
+				aggExpression = bson.M{"$size": bson.M{"$ifNull": []interface{}{"$" + outputField, []interface{}{}}}}
+			} else {
+				aggExpression = bson.M{"$max": bson.M{
+					"$map": bson.M{
+						"input": bson.M{"$ifNull": []interface{}{"$" + outputField, []interface{}{}}},
+						"as":    "item",
+						"in":    "$$item." + agg.Column,
+					},
+				}}
+			}
+
+		case AggregateMin:
+			if agg.Column == "" {
+				// If no column specified, use count as min (same as count for non-empty arrays)
+				aggExpression = bson.M{"$size": bson.M{"$ifNull": []interface{}{"$" + outputField, []interface{}{}}}}
+			} else {
+				aggExpression = bson.M{"$min": bson.M{
+					"$map": bson.M{
+						"input": bson.M{"$ifNull": []interface{}{"$" + outputField, []interface{}{}}},
+						"as":    "item",
+						"in":    "$$item." + agg.Column,
+					},
+				}}
+			}
+		}
+
+		if aggExpression != nil {
+			addFields[agg.As] = aggExpression
+		}
+	}
+
+	if len(addFields) > 0 {
+		stages = append(stages, bson.M{"$addFields": addFields})
+	}
+
+	return stages
 }
 
 // buildNestedLookupStages builds MongoDB aggregation pipeline stages for nested
