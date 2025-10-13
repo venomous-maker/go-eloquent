@@ -2497,7 +2497,22 @@ func (e *Eloquent[T]) Explain() (bson.M, error) {
 	}, nil
 }
 
-// Clone creates a copy of the query builder
+// Clone returns a deep copy of the Eloquent instance.
+//
+// This method is useful for creating a new query instance that is separate
+// from the original query instance. This is particularly important when
+// modifying the query instance (e.g., adding WHERE conditions, etc.).
+//
+// The returned instance will have the same underlying service and collection
+// as the original instance, but with a new set of WHERE conditions and
+// options.
+//
+// Example:
+//
+// userSvc := examples.NewUserService(ctx, mongoDB)
+// query := userSvc.Query().Where("name", "John Doe")
+// newQuery := query.Clone()
+// newQuery.Where("age", 18) // newQuery is a separate instance from query
 func (e *Eloquent[T]) Clone() *Eloquent[T] {
 	clone := &Eloquent[T]{
 		service:      e.service,
@@ -2510,8 +2525,10 @@ func (e *Eloquent[T]) Clone() *Eloquent[T] {
 		relations:    make([]Relation, len(e.relations)),
 		withCount:    make([]string, len(e.withCount)),
 		scopes:       make([]func(*Eloquent[T]) *Eloquent[T], len(e.scopes)),
+		aggregates:   make([]Aggregate, len(e.aggregates)),
 	}
 
+	// Copy basic slices
 	copy(clone.wheres, e.wheres)
 	copy(clone.orWheres, e.orWheres)
 	copy(clone.orders, e.orders)
@@ -2519,7 +2536,9 @@ func (e *Eloquent[T]) Clone() *Eloquent[T] {
 	copy(clone.relations, e.relations)
 	copy(clone.withCount, e.withCount)
 	copy(clone.scopes, e.scopes)
+	copy(clone.aggregates, e.aggregates)
 
+	// Copy maps
 	for k, v := range e.whereIns {
 		clone.whereIns[k] = make([]interface{}, len(v))
 		copy(clone.whereIns[k], v)
@@ -2530,6 +2549,24 @@ func (e *Eloquent[T]) Clone() *Eloquent[T] {
 		copy(clone.whereNotIns[k], v)
 	}
 
+	// Copy relationship condition maps
+	if e.whereHasConditions != nil {
+		clone.whereHasConditions = make(map[string][]bson.M)
+		for k, v := range e.whereHasConditions {
+			clone.whereHasConditions[k] = make([]bson.M, len(v))
+			copy(clone.whereHasConditions[k], v)
+		}
+	}
+
+	if e.whereDoesntHaveConditions != nil {
+		clone.whereDoesntHaveConditions = make(map[string][]bson.M)
+		for k, v := range e.whereDoesntHaveConditions {
+			clone.whereDoesntHaveConditions[k] = make([]bson.M, len(v))
+			copy(clone.whereDoesntHaveConditions[k], v)
+		}
+	}
+
+	// Copy pointers
 	if e.limitNum != nil {
 		limit := *e.limitNum
 		clone.limitNum = &limit
@@ -2538,6 +2575,11 @@ func (e *Eloquent[T]) Clone() *Eloquent[T] {
 	if e.skipNum != nil {
 		skip := *e.skipNum
 		clone.skipNum = &skip
+	}
+
+	if e.cacheTTL != nil {
+		ttl := *e.cacheTTL
+		clone.cacheTTL = &ttl
 	}
 
 	return clone
