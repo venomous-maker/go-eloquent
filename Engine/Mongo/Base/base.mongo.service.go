@@ -116,7 +116,30 @@ type Eloquent[T BaseModels.MongoModel] struct {
 	scopes         []func(*Eloquent[T]) *Eloquent[T]
 	softDeleteMode int // 0=active(default),1=withTrashed,2=onlyTrashed
 	cacheTTL       *time.Duration
+
+	// NEW: Add fields for advanced relationship queries
+	whereHasConditions        map[string][]bson.M // relation -> conditions
+	whereDoesntHaveConditions map[string][]bson.M // relation -> conditions
+	aggregates                []Aggregate         // for withCount, withSum, etc.
 }
+
+// Aggregate represents an aggregation operation on a relationship
+type Aggregate struct {
+	Relation string
+	Function AggregateFunction
+	Column   string
+	As       string // output field name
+}
+
+type AggregateFunction string
+
+const (
+	AggregateCount AggregateFunction = "count"
+	AggregateSum   AggregateFunction = "sum"
+	AggregateAvg   AggregateFunction = "avg"
+	AggregateMax   AggregateFunction = "max"
+	AggregateMin   AggregateFunction = "min"
+)
 
 const (
 	softDeleteActive = iota
@@ -2005,19 +2028,43 @@ func (e *Eloquent[T]) Raw(pipeline []bson.M) ([]bson.M, error) {
 
 // WhereHas filters based on relationship existence
 func (e *Eloquent[T]) WhereHas(relation string, callback func(*Eloquent[T]) *Eloquent[T]) *Eloquent[T] {
-	// This would build a complex aggregation pipeline
-	// For now, simplified implementation
-	if callback != nil {
-		subQuery := e.service.Query()
-		subQuery = callback(subQuery)
-		// Apply subquery logic here
+	if e.whereHasConditions == nil {
+		e.whereHasConditions = make(map[string][]bson.M)
 	}
+
+	// Create a subquery for the relationship
+	subQuery := e.service.Query()
+	if callback != nil {
+		subQuery = callback(subQuery)
+	}
+
+	// Build the filter from the subquery
+	filter := subQuery.buildFilter()
+
+	// Store the conditions for this relationship
+	e.whereHasConditions[relation] = append(e.whereHasConditions[relation], filter)
+
 	return e
 }
 
 // WhereDoesntHave filters based on relationship non-existence
 func (e *Eloquent[T]) WhereDoesntHave(relation string, callback func(*Eloquent[T]) *Eloquent[T]) *Eloquent[T] {
-	// Similar to WhereHas but inverted
+	if e.whereDoesntHaveConditions == nil {
+		e.whereDoesntHaveConditions = make(map[string][]bson.M)
+	}
+
+	// Create a subquery for the relationship
+	subQuery := e.service.Query()
+	if callback != nil {
+		subQuery = callback(subQuery)
+	}
+
+	// Build the filter from the subquery
+	filter := subQuery.buildFilter()
+
+	// Store the conditions for this relationship
+	e.whereDoesntHaveConditions[relation] = append(e.whereDoesntHaveConditions[relation], filter)
+
 	return e
 }
 
