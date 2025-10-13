@@ -438,10 +438,10 @@ func (e *Eloquent[T]) With(relations ...string) *Eloquent[T] {
 }
 
 // WithCount loads relationship counts
-func (e *Eloquent[T]) WithCount(relations ...string) *Eloquent[T] {
-	e.withCount = append(e.withCount, relations...)
-	return e
-}
+//func (e *Eloquent[T]) WithCount(relations ...string) *Eloquent[T] {
+//	e.withCount = append(e.withCount, relations...)
+//	return e
+//}
 
 // Load lazy loads relationships on existing models
 func (e *Eloquent[T]) Load(model T, relations ...string) T {
@@ -2070,8 +2070,75 @@ func (e *Eloquent[T]) WhereDoesntHave(relation string, callback func(*Eloquent[T
 
 // WithAggregate adds aggregation functions like withCount, withSum, etc.
 func (e *Eloquent[T]) WithAggregate(relation, function, column string) *Eloquent[T] {
-	// Implementation for withCount, withSum, withAvg, etc.
+	return e.WithAggregateAs(relation, function, column, "")
+}
+
+// WithAggregateAs adds aggregation functions with custom alias
+func (e *Eloquent[T]) WithAggregateAs(relation, function, column, alias string) *Eloquent[T] {
+	if e.aggregates == nil {
+		e.aggregates = make([]Aggregate, 0)
+	}
+
+	// Parse function
+	var aggFunc AggregateFunction
+	switch strings.ToLower(function) {
+	case "count", "size":
+		aggFunc = AggregateCount
+	case "sum":
+		aggFunc = AggregateSum
+	case "avg", "average":
+		aggFunc = AggregateAvg
+	case "max":
+		aggFunc = AggregateMax
+	case "min":
+		aggFunc = AggregateMin
+	default:
+		// Default to count if unknown function
+		aggFunc = AggregateCount
+	}
+
+	// Generate alias if not provided
+	if alias == "" {
+		alias = relation + "_" + string(aggFunc)
+		if column != "" && aggFunc != AggregateCount {
+			alias += "_" + column
+		}
+	}
+
+	aggregate := Aggregate{
+		Relation: relation,
+		Function: aggFunc,
+		Column:   column,
+		As:       alias,
+	}
+
+	e.aggregates = append(e.aggregates, aggregate)
 	return e
+}
+
+// Convenience methods for common aggregates
+func (e *Eloquent[T]) WithCount(relation string, columns ...string) *Eloquent[T] {
+	column := ""
+	if len(columns) > 0 {
+		column = columns[0]
+	}
+	return e.WithAggregate(relation, "count", column)
+}
+
+func (e *Eloquent[T]) WithSum(relation, column string) *Eloquent[T] {
+	return e.WithAggregate(relation, "sum", column)
+}
+
+func (e *Eloquent[T]) WithAvg(relation, column string) *Eloquent[T] {
+	return e.WithAggregate(relation, "avg", column)
+}
+
+func (e *Eloquent[T]) WithMax(relation, column string) *Eloquent[T] {
+	return e.WithAggregate(relation, "max", column)
+}
+
+func (e *Eloquent[T]) WithMin(relation, column string) *Eloquent[T] {
+	return e.WithAggregate(relation, "min", column)
 }
 
 // ==================== Chunking and Batching ====================
