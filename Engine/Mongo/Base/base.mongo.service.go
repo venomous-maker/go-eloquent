@@ -125,17 +125,20 @@ const (
 )
 
 // Relation represents a relationship configuration
+// Enhanced Relation with better field tracking
 type Relation struct {
-	Name       string               // The relationship name (source token)
-	Type       RelationType         // belongsTo, hasOne, hasMany, etc.
-	Related    string               // Related collection name
-	ForeignKey string               // Foreign key field
-	LocalKey   string               // Local key field
-	Conditions bson.M               // Additional conditions
-	Pivot      *PivotConfig         // For many-to-many relationships
-	Nested     map[string]*Relation // Nested relationships
-	Required   bool                 // Inner join vs left join
-	As         string               // Optional alias for where to attach the relation in the resulting document
+	Name       string
+	Type       RelationType
+	Related    string
+	ForeignKey string
+	LocalKey   string
+	Conditions bson.M
+	Pivot      *PivotConfig
+	Nested     map[string]*Relation
+	Required   bool
+	As         string
+	// Track the parent path for nested relations
+	ParentPath string
 }
 
 // OutputField returns the field name the relation should be attached to
