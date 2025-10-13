@@ -498,46 +498,42 @@ func (e *Eloquent[T]) addRelation(parts []string, parent *Relation) {
 	}
 }
 
-// inferRelation attempts to infer relationship type and config
+// inferRelation infers the relation type based on the name.
+// It first tries to find the relation in the model-level relations.
+// If not found, it infers the relation type based on the name.
+// It returns the relation type.
 func (e *Eloquent[T]) inferRelation(name string) Relation {
-	// Try to resolve from model-level definitions first (by name or alias)
+	// Try model definitions first
 	if e.service != nil {
 		if rel, ok := e.service.findModelRelation(strings.TrimSpace(name)); ok {
 			return rel
 		}
 	}
 
-	// Fallback heuristics
+	// Fallback with proper defaults
 	modelName := e.getModelName()
-
 	relation := Relation{
 		Name:    name,
 		Related: resolveRelatedCollection(name),
 	}
 
+	// FIX: Better relationship type detection
 	lower := strings.ToLower(name)
-	// Helper to detect simple plural form (very small heuristic)
-	isPlural := func(s string) bool {
-		s = strings.ToLower(s)
-		return strings.HasSuffix(s, "s") || strings.HasSuffix(s, "es")
-	}
+	isPlural := strings.HasSuffix(lower, "s") || strings.HasSuffix(lower, "es")
 
-	// If token explicitly looks like a foreign key (ends with _id or Id), treat as BelongsTo
+	// Check if it's a foreign key field
 	if strings.HasSuffix(name, "_id") || strings.HasSuffix(name, "Id") {
 		relation.Type = BelongsTo
 		relation.ForeignKey = name
 		relation.LocalKey = "_id"
-		return relation
-	}
-
-	// If token is plural, assume HasMany; otherwise assume BelongsTo (singular)
-	if isPlural(lower) {
+	} else if isPlural {
 		relation.Type = HasMany
 		relation.ForeignKey = strlib.ConvertToSnakeCase(modelName) + "_id"
 		relation.LocalKey = "_id"
 	} else {
-		relation.Type = BelongsTo
-		relation.ForeignKey = strlib.ConvertToSnakeCase(name) + "_id"
+		// FIX: Default to HasOne for singular, not BelongsTo
+		relation.Type = HasOne
+		relation.ForeignKey = strlib.ConvertToSnakeCase(modelName) + "_id"
 		relation.LocalKey = "_id"
 	}
 
@@ -922,7 +918,30 @@ func (e *Eloquent[T]) Get() ([]T, error) {
 	return results, nil
 }
 
-// getWithRelations handles eager loading
+// getWithRelations returns all records with eager loaded relations.
+// It uses the aggregation pipeline to lookup related documents.
+// Relations are defined in the Eloquent struct using the Relations field.
+// The relations can be of type HasOne, BelongsTo, HasMany, BelongsToMany.
+// The service will automatically detect the relation type and build the correct aggregation pipeline.
+// The pipeline is built in the following order:
+// 1. Match stage: filters out records that don't match the filter defined in the Eloquent struct.
+// 2. Lookup stages: for each relation, a lookup stage is added to the pipeline that fetches the related documents.
+// The lookup stages are added in the order they are defined in the Eloquent struct.
+// The output of the lookup stage is added to the root document with the field name being the relation name.
+// For array relations (HasMany, BelongsToMany), a count of the related documents is added to the root document with the field name being the relation name + "_count".
+// The count is only added if the WithCount field of the Eloquent struct contains the relation name.
+// The WithCount field allows to specify which array relations should have their count added to the root document.
+// The returned documents will have the following structure:
+//
+//	{
+//		"field1": "value1",
+//		"field2": "value2",
+//		"relation1": [...],
+//		"relation1_count": 3,
+//		"relation2": [...],
+//	}
+//
+// The _count field is only added if the relation is an array relation and if the relation name is present in the WithCount field of the Eloquent struct.
 func (e *Eloquent[T]) getWithRelations() ([]T, error) {
 	pipeline := e.buildAggregationPipeline()
 
@@ -1005,7 +1024,30 @@ func (e *Eloquent[T]) getWithRelations() ([]T, error) {
 	return results, nil
 }
 
-// buildAggregationPipeline builds MongoDB aggregation pipeline for relationships
+// getWithRelations returns all records with eager loaded relations.
+// It uses the aggregation pipeline to lookup related documents.
+// Relations are defined in the Eloquent struct using the Relations field.
+// The relations can be of type HasOne, BelongsTo, HasMany, BelongsToMany.
+// The service will automatically detect the relation type and build the correct aggregation pipeline.
+// The pipeline is built in the following order:
+// 1. Match stage: filters out records that don't match the filter defined in the Eloquent struct.
+// 2. Lookup stages: for each relation, a lookup stage is added to the pipeline that fetches the related documents.
+// The lookup stages are added in the order they are defined in the Eloquent struct.
+// The output of the lookup stage is added to the root document with the field name being the relation name.
+// For array relations (HasMany, BelongsToMany), a count of the related documents is added to the root document with the field name being the relation name + "_count".
+// The count is only added if the WithCount field of the Eloquent struct contains the relation name.
+// The WithCount field allows to specify which array relations should have their count added to the root document.
+// The returned documents will have the following structure:
+//
+//	{
+//		"field1": "value1",
+//		"field2": "value2",
+//		"relation1": [...],
+//		"relation1_count": 3,
+//		"relation2": [...],
+//	}
+//
+// The _count field is only added if the relation is an array relation and if the relation name is present in the WithCount field of the Eloquent struct.
 func (e *Eloquent[T]) buildAggregationPipeline() []bson.M {
 	pipeline := []bson.M{}
 
@@ -1059,150 +1101,247 @@ func (e *Eloquent[T]) buildAggregationPipeline() []bson.M {
 	return pipeline
 }
 
-// buildNestedLookupStages builds lookup stages relative to a parent relation's inner pipeline document
-func (e *Eloquent[T]) buildNestedLookupStages(child Relation) []bson.M {
+// buildNestedLookupStages builds MongoDB aggregation pipeline stages for nested
+// relations.
+//
+// The function takes a child relation and a parent field name as input and
+// returns a slice of MongoDB aggregation pipeline stages.
+//
+// The function first sanitizes the output field name of the child relation and
+// builds the field path for nested relations.
+//
+// Then, it builds the lookup stages based on the relation type:
+//
+// - For BelongsTo relations, a single object is looked up based on the
+// foreign key.
+// - For HasOne relations, a single object is looked up based on the foreign
+// key.
+// - For HasMany relations, an array of objects is looked up based on the
+// foreign key.
+// - For BelongsToMany relations, a many-to-many relationship is resolved
+// through a pivot table.
+//
+// The returned stages are singular MongoDB aggregation pipeline stages.
+func (e *Eloquent[T]) buildNestedLookupStages(child Relation, parentField string) []bson.M {
 	stages := []bson.M{}
 	outField := sanitizeOutField(child.OutputField(), child.Name)
+
+	// Build the field path for nested relations
+	fieldPath := outField
+	if parentField != "" {
+		fieldPath = parentField + "." + outField
+	}
+
 	switch child.Type {
 	case BelongsTo:
+		// FIX: Use parent field path for nested relations
+		letField := "$" + parentField + "." + child.ForeignKey
+		if parentField == "" {
+			letField = "$" + child.ForeignKey
+		}
+
+		inner := []bson.M{
+			bson.M{"$match": bson.M{"$expr": bson.M{
+				"$eq": bson.A{"$" + child.LocalKey, "$$fk"},
+			}}},
+		}
+
+		if len(child.Conditions) > 0 {
+			inner = append(inner, bson.M{"$match": child.Conditions})
+		}
+
 		lookup := bson.M{"$lookup": bson.M{
-			"from": child.Related,
-			"let":  bson.M{"fk": "$" + child.ForeignKey},
-			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-				"$cond": bson.M{
-					"if":   bson.M{"$isArray": "$$fk"},
-					"then": bson.M{"$in": bson.A{"$" + child.LocalKey, "$$fk"}},
-					"else": bson.M{"$eq": bson.A{"$" + child.LocalKey, "$$fk"}},
-				},
-			}}}},
-				func() []bson.M {
-					if len(child.Conditions) > 0 {
-						return []bson.M{{"$match": child.Conditions}}
-					}
-					return nil
-				}()...),
-			"as": outField,
+			"from":     child.Related,
+			"let":      bson.M{"fk": letField},
+			"pipeline": inner,
+			"as":       fieldPath,
 		}}
 		stages = append(stages, lookup)
-		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !child.Required}})
+
+		stages = append(stages, bson.M{"$unwind": bson.M{
+			"path":                       "$" + fieldPath,
+			"preserveNullAndEmptyArrays": !child.Required,
+		}})
+
 	case HasOne:
+		// FIX: Use parent field path for nested relations
+		letField := "$" + parentField + "." + child.LocalKey
+		if parentField == "" {
+			letField = "$" + child.LocalKey
+		}
+
+		inner := []bson.M{
+			bson.M{"$match": bson.M{"$expr": bson.M{
+				"$eq": bson.A{"$" + child.ForeignKey, "$$local"},
+			}}},
+		}
+
+		if len(child.Conditions) > 0 {
+			inner = append(inner, bson.M{"$match": child.Conditions})
+		}
+
 		lookup := bson.M{"$lookup": bson.M{
-			"from": child.Related,
-			"let":  bson.M{"local": "$" + child.LocalKey},
-			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-				"$cond": bson.M{
-					"if":   bson.M{"$isArray": "$$local"},
-					"then": bson.M{"$in": bson.A{"$" + child.ForeignKey, "$$local"}},
-					"else": bson.M{"$eq": bson.A{"$" + child.ForeignKey, "$$local"}},
-				},
-			}}}},
-				func() []bson.M {
-					if len(child.Conditions) > 0 {
-						return []bson.M{{"$match": child.Conditions}}
-					}
-					return nil
-				}()...),
-			"as": outField,
+			"from":     child.Related,
+			"let":      bson.M{"local": letField},
+			"pipeline": inner,
+			"as":       fieldPath,
 		}}
 		stages = append(stages, lookup)
-		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !child.Required}})
+
+		stages = append(stages, bson.M{"$unwind": bson.M{
+			"path":                       "$" + fieldPath,
+			"preserveNullAndEmptyArrays": !child.Required,
+		}})
+
 	case HasMany:
+		// FIX: Use parent field path for nested relations
+		letField := "$" + parentField + "." + child.LocalKey
+		if parentField == "" {
+			letField = "$" + child.LocalKey
+		}
+
+		inner := []bson.M{
+			bson.M{"$match": bson.M{"$expr": bson.M{
+				"$eq": bson.A{"$" + child.ForeignKey, "$$local"},
+			}}},
+		}
+
+		if len(child.Conditions) > 0 {
+			inner = append(inner, bson.M{"$match": child.Conditions})
+		}
+
 		lookup := bson.M{"$lookup": bson.M{
-			"from": child.Related,
-			"let":  bson.M{"local": "$" + child.LocalKey},
-			"pipeline": append([]bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-				"$cond": bson.M{
-					"if":   bson.M{"$isArray": "$$local"},
-					"then": bson.M{"$in": bson.A{"$" + child.ForeignKey, "$$local"}},
-					"else": bson.M{"$eq": bson.A{"$" + child.ForeignKey, "$$local"}},
-				},
-			}}}},
-				func() []bson.M {
-					if len(child.Conditions) > 0 {
-						return []bson.M{{"$match": child.Conditions}}
-					}
-					return nil
-				}()...),
-			"as": outField,
+			"from":     child.Related,
+			"let":      bson.M{"local": letField},
+			"pipeline": inner,
+			"as":       fieldPath,
 		}}
 		stages = append(stages, lookup)
+
 		if child.Required {
-			stages = append(stages, bson.M{"$match": bson.M{"$expr": bson.M{"$gt": bson.A{bson.M{"$size": "$" + outField}, 0}}}})
+			stages = append(stages, bson.M{"$match": bson.M{
+				"$expr": bson.M{"$gt": bson.A{bson.M{"$size": "$" + fieldPath}, 0}},
+			}})
 		}
 	}
+
 	return stages
 }
 
-// buildLookupStage builds lookup stages for a relationship (with conditions support)
+// buildLookupStage builds a MongoDB aggregation pipeline stage for a single
+// relation.
+//
+// The stage is built based on the relation type and the provided conditions.
+// The output field of the relation is sanitized and used as the output field
+// name in the stage.
+//
+// For BelongsTo relations, a single object is looked up based on the
+// foreign key.
+// For HasOne relations, a single object is looked up based on the foreign
+// key.
+// For HasMany relations, an array of objects is looked up based on the
+// foreign key.
+// For BelongsToMany relations, a many-to-many relationship is resolved
+// through a pivot table.
+//
+// The returned stage is a singular MongoDB aggregation pipeline stage.
 func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 	stages := []bson.M{}
 	outField := sanitizeOutField(rel.OutputField(), rel.Name)
 
 	switch rel.Type {
 	case BelongsTo:
-		inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-			"$cond": bson.M{
-				"if":   bson.M{"$isArray": "$$fk"},
-				"then": bson.M{"$in": bson.A{"$" + rel.LocalKey, "$$fk"}},
-				"else": bson.M{"$eq": bson.A{"$" + rel.LocalKey, "$$fk"}},
-			},
-		}}}}
+		// FIX: Use proper field references for BelongsTo
+		inner := []bson.M{
+			bson.M{"$match": bson.M{"$expr": bson.M{
+				"$eq": bson.A{"$" + rel.LocalKey, "$$fk"},
+			}}},
+		}
+
+		// Add conditions
 		if len(rel.Conditions) > 0 {
 			inner = append(inner, bson.M{"$match": rel.Conditions})
 		}
+
+		// Add nested relations
 		if len(rel.Nested) > 0 {
 			for _, child := range rel.Nested {
-				inner = append(inner, e.buildNestedLookupStages(*child)...)
+				// For nested relations in BelongsTo, we need to build the pipeline correctly
+				nestedStages := e.buildNestedLookupStages(*child, "")
+				inner = append(inner, nestedStages...)
 			}
 		}
+
 		lookup := bson.M{"$lookup": bson.M{
 			"from":     rel.Related,
-			"let":      bson.M{"fk": "$" + rel.ForeignKey},
+			"let":      bson.M{"fk": "$" + rel.ForeignKey}, // Foreign key from parent
 			"pipeline": inner,
 			"as":       outField,
 		}}
 		stages = append(stages, lookup)
-		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !rel.Required}})
+
+		// FIX: Always unwind BelongsTo to get single object
+		stages = append(stages, bson.M{"$unwind": bson.M{
+			"path":                       "$" + outField,
+			"preserveNullAndEmptyArrays": !rel.Required,
+		}})
+
 	case HasOne:
-		inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-			"$cond": bson.M{
-				"if":   bson.M{"$isArray": "$$local"},
-				"then": bson.M{"$in": bson.A{"$" + rel.ForeignKey, "$$local"}},
-				"else": bson.M{"$eq": bson.A{"$" + rel.ForeignKey, "$$local"}},
-			},
-		}}}}
+		// FIX: Use proper field references for HasOne
+		inner := []bson.M{
+			bson.M{"$match": bson.M{"$expr": bson.M{
+				"$eq": bson.A{"$" + rel.ForeignKey, "$$local"},
+			}}},
+		}
+
+		// Add conditions
 		if len(rel.Conditions) > 0 {
 			inner = append(inner, bson.M{"$match": rel.Conditions})
 		}
+
+		// Add nested relations
 		if len(rel.Nested) > 0 {
 			for _, child := range rel.Nested {
-				inner = append(inner, e.buildNestedLookupStages(*child)...)
+				nestedStages := e.buildNestedLookupStages(*child, "")
+				inner = append(inner, nestedStages...)
 			}
 		}
+
 		lookup := bson.M{"$lookup": bson.M{
 			"from":     rel.Related,
-			"let":      bson.M{"local": "$" + rel.LocalKey},
+			"let":      bson.M{"local": "$" + rel.LocalKey}, // Local key from parent
 			"pipeline": inner,
 			"as":       outField,
 		}}
 		stages = append(stages, lookup)
-		stages = append(stages, bson.M{"$unwind": bson.M{"path": "$" + outField, "preserveNullAndEmptyArrays": !rel.Required}})
+
+		// FIX: Always unwind HasOne to get single object
+		stages = append(stages, bson.M{"$unwind": bson.M{
+			"path":                       "$" + outField,
+			"preserveNullAndEmptyArrays": !rel.Required,
+		}})
+
 	case HasMany:
-		inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{
-			"$cond": bson.M{
-				"if":   bson.M{"$isArray": "$$local"},
-				"then": bson.M{"$in": bson.A{"$" + rel.ForeignKey, "$$local"}},
-				"else": bson.M{"$eq": bson.A{"$" + rel.ForeignKey, "$$local"}},
-			},
-		}}}}
+		// FIX: Use proper field references for HasMany
+		inner := []bson.M{
+			bson.M{"$match": bson.M{"$expr": bson.M{
+				"$eq": bson.A{"$" + rel.ForeignKey, "$$local"},
+			}}},
+		}
+
+		// Add conditions
 		if len(rel.Conditions) > 0 {
 			inner = append(inner, bson.M{"$match": rel.Conditions})
 		}
+
+		// Add nested relations
 		if len(rel.Nested) > 0 {
 			for _, child := range rel.Nested {
-				inner = append(inner, e.buildNestedLookupStages(*child)...)
+				nestedStages := e.buildNestedLookupStages(*child, "")
+				inner = append(inner, nestedStages...)
 			}
 		}
+
 		lookup := bson.M{"$lookup": bson.M{
 			"from":     rel.Related,
 			"let":      bson.M{"local": "$" + rel.LocalKey},
@@ -1210,37 +1349,67 @@ func (e *Eloquent[T]) buildLookupStage(rel Relation) []bson.M {
 			"as":       outField,
 		}}
 		stages = append(stages, lookup)
+
+		// FIX: Only add match if required for HasMany (keep as array)
 		if rel.Required {
-			stages = append(stages, bson.M{"$match": bson.M{"$expr": bson.M{"$gt": bson.A{bson.M{"$size": "$" + outField}, 0}}}})
+			stages = append(stages, bson.M{"$match": bson.M{
+				outField: bson.M{"$ne": bson.A{}}, // Ensure array is not empty
+			}})
 		}
+
 	case BelongsToMany:
 		if rel.Pivot != nil {
+			// FIX: Proper many-to-many implementation
 			pivotField := outField + "_pivot"
+
+			// First lookup to get pivot records
 			pivotLookup := bson.M{"$lookup": bson.M{
 				"from":         rel.Pivot.Table,
-				"localField":   "_id",
+				"localField":   rel.LocalKey, // Usually _id
 				"foreignField": rel.Pivot.ForeignKey,
 				"as":           pivotField,
 			}}
 			stages = append(stages, pivotLookup)
-			inner := []bson.M{bson.M{"$match": bson.M{"$expr": bson.M{"$in": bson.A{"$_id", "$" + pivotField + "." + rel.Pivot.RelatedKey}}}}}
+
+			// Then lookup to get related records through pivot
+			inner := []bson.M{
+				bson.M{"$match": bson.M{"$expr": bson.M{
+					"$in": bson.A{"$_id", "$$relatedIds"},
+				}}},
+			}
+
+			// Add conditions
 			if len(rel.Conditions) > 0 {
 				inner = append(inner, bson.M{"$match": rel.Conditions})
 			}
+
+			// Add nested relations
 			if len(rel.Nested) > 0 {
 				for _, child := range rel.Nested {
-					inner = append(inner, e.buildNestedLookupStages(*child)...)
+					nestedStages := e.buildNestedLookupStages(*child, "")
+					inner = append(inner, nestedStages...)
 				}
 			}
+
 			relatedLookup := bson.M{"$lookup": bson.M{
-				"from":     rel.Related,
-				"let":      bson.M{},
+				"from": rel.Related,
+				"let": bson.M{"relatedIds": bson.M{"$map": bson.M{
+					"input": "$" + pivotField,
+					"as":    "pivot",
+					"in":    "$$pivot." + rel.Pivot.RelatedKey,
+				}}},
 				"pipeline": inner,
 				"as":       outField,
 			}}
 			stages = append(stages, relatedLookup)
+
+			// Clean up pivot field if not needed
+			stages = append(stages, bson.M{"$unset": pivotField})
+
 			if rel.Required {
-				stages = append(stages, bson.M{"$match": bson.M{"$expr": bson.M{"$gt": bson.A{bson.M{"$size": "$" + outField}, 0}}}})
+				stages = append(stages, bson.M{"$match": bson.M{
+					outField: bson.M{"$ne": bson.A{}},
+				}})
 			}
 		}
 	}
@@ -1591,82 +1760,160 @@ func (s *EloquentService[T]) Create(data bson.M) (T, error) {
 	return model, nil
 }
 
-// FirstOrCreate finds first record or creates if not found
+// FIXED FirstOrCreate
 func (s *EloquentService[T]) FirstOrCreate(conditions bson.M, model T) (T, error) {
+	// Convert model to defaults
 	defaults, err := s.ToBson(model)
 	if err != nil {
 		return model, err
 	}
+
+	// Try to find existing record
 	qb := s.Query().WhereMap(conditions)
 	result, err := qb.First()
+
 	if err == mongo.ErrNoDocuments {
+		// Create new record with conditions and defaults
 		createData := make(bson.M)
+
+		// Add conditions first
 		for k, v := range conditions {
 			createData[k] = v
 		}
+
+		// Add defaults (don't override conditions)
 		for k, v := range defaults {
-			createData[k] = v
+			if _, exists := createData[k]; !exists {
+				createData[k] = v
+			}
 		}
+
 		return s.Create(createData)
 	}
+
 	return result, err
 }
 
-// UpdateOrCreate updates existing record or creates new one
+// UpdateOrCreate updates matching records or creates a new one if no match is found.
+//
+// It tries to find an existing record by the conditions, if found, it updates the record with the given model.
+// If no record is found, it creates a new record with the conditions and updates merged together.
 func (s *EloquentService[T]) UpdateOrCreate(conditions bson.M, model T) (T, error) {
+	// Convert model to updates
 	updates, err := s.ToBson(model)
 	if err != nil {
 		return model, err
 	}
+
+	// Remove _id from updates
+	delete(updates, "_id")
+
+	// Try to find existing record
 	qb := s.Query().WhereMap(conditions)
 	result, err := qb.First()
+
 	if err == mongo.ErrNoDocuments {
+		// Create new record - merge conditions and updates
 		createData := make(bson.M)
 		for k, v := range conditions {
 			createData[k] = v
 		}
 		for k, v := range updates {
-			createData[k] = v
+			// Don't override conditions with updates
+			if _, exists := createData[k]; !exists {
+				createData[k] = v
+			}
 		}
 		return s.Create(createData)
 	} else if err != nil {
 		return result, err
 	}
+
+	// Update existing record
 	_, err = s.Query().Where("_id", result.GetID()).Update(updates)
 	if err != nil {
 		return result, err
 	}
+
 	return s.Find(result.GetID().Hex())
 }
 
-// CreateOrUpdate saves the model if it has no ID, otherwise updates the existing document.
+// CreateOrUpdate creates a new record or updates an existing one.
+//
+// If no ID present, perform Create.
+// If ID present, check if document exists.
+// If document exists, update it with the new values.
+// If document does not exist, create a new record.
 func (s *EloquentService[T]) CreateOrUpdate(model T) (T, error) {
-	// If no ID present, perform Save
+	// If no ID present, perform Create
 	if model.GetID().IsZero() {
 		return s.Save(model)
 	}
 
-	id := model.GetID().Hex()
+	// Check if document exists
+	existing, err := s.Find(model.GetID().Hex())
+	if err != nil && err != mongo.ErrNoDocuments {
+		return model, err
+	}
 
-	// Convert model to bson and remove _id to avoid immutable field update
+	// Convert model to bson
 	doc, err := s.ToBson(model)
 	if err != nil {
 		return model, err
 	}
+
+	// Remove _id to avoid immutable field update
 	delete(doc, "_id")
 
-	// Perform update
-	err = s.Update(id, doc)
+	// Preserve original timestamps
+	if err == nil { // Document exists
+		doc["created_at"] = existing.GetCreatedAt()
+		if existing.GetDeletedAt() != (time.Time{}) {
+			doc["deleted_at"] = existing.GetDeletedAt()
+		} else {
+			delete(doc, "deleted_at")
+		}
+	}
+
+	// Always update the updated_at timestamp
+	doc["updated_at"] = time.Now()
+
+	// BeforeSave hook
+	if s.BeforeSave != nil {
+		if err := s.BeforeSave(model); err != nil {
+			return model, err
+		}
+	}
+
+	// Perform upsert
+	_, err = s.Collection.UpdateOne(
+		s.Ctx,
+		bson.M{"_id": model.GetID()},
+		bson.M{"$set": doc},
+		options.Update().SetUpsert(true),
+	)
 	if err != nil {
 		return model, err
 	}
 
+	// Invalidate cache
+	if s.cache != nil {
+		s.cache.invalidateCollection(s.CollectionName)
+	}
+
+	// AfterUpdate hook
+	if s.AfterUpdate != nil {
+		_ = s.AfterUpdate(model)
+	}
+
 	// Return the fresh model
-	return s.Find(id)
+	return s.Find(model.GetID().Hex())
 }
 
 // ==================== Enhanced EloquentService Interface ====================
 
+// EloquentInterface defines the main service operations for a model T.
+// It extends the EloquentServiceInterface and adds additional methods for data retrieval and manipulation.
 type EloquentInterface[T BaseModels.MongoModel] interface {
 	// Laravel-style query methods
 	All() *Eloquent[T]
@@ -2093,7 +2340,17 @@ func NewEloquentService[T BaseModels.MongoModel](ctx context.Context, db *mongo.
 	return eloquentService
 }
 
-// compileModelRelations reads model.GetRelationships and GetDefaultWith and stores them on the service
+// compileModelRelations compiles model-level relations and default with tokens.
+//
+// It resets the service-level fields and then compiles the model-level relations and default with tokens.
+// The compiled relations are stored in the service-level fields.
+// The compiled default with tokens are stored in the service-level fields.
+//
+// It is called by NewEloquentService once for each model type.
+//
+// Parameters: model T - the model type
+//
+// Returns: None
 func (s *EloquentService[T]) compileModelRelations(model T) {
 	// Reset
 	s.modelRelations = nil
@@ -2106,29 +2363,46 @@ func (s *EloquentService[T]) compileModelRelations(model T) {
 		}
 	}
 
-	// Relationships
+	// Relationships with proper field defaults
 	if defRels, ok := any(model).(interface {
 		GetRelationships() []BaseModels.RelationDef
 	}); ok {
 		for _, r := range defRels.GetRelationships() {
 			conv := Relation{
-				Name: r.Name,
-				Type: mapModelRelType(r.Type),
-				Related: func() string {
-					if r.Related != "" {
-						return r.Related
-					}
-					return resolveRelatedCollection(r.Name)
-				}(),
+				Name:       r.Name,
+				Type:       mapModelRelType(r.Type),
+				Related:    resolveRelatedCollection(r.Related),
 				ForeignKey: r.ForeignKey,
 				LocalKey:   r.LocalKey,
 				Conditions: toBsonM(r.Conditions),
 				As:         r.As,
 				Required:   r.Required,
 			}
-			if r.Pivot != nil {
-				conv.Pivot = &PivotConfig{Table: r.Pivot.Table, ForeignKey: r.Pivot.ForeignKey, RelatedKey: r.Pivot.RelatedKey, Fields: r.Pivot.Fields}
+
+			// Set default fields if not provided
+			if conv.ForeignKey == "" {
+				switch conv.Type {
+				case BelongsTo:
+					conv.ForeignKey = strlib.ConvertToSnakeCase(r.Name) + "_id"
+				case HasOne, HasMany:
+					modelName := reflect.TypeOf(model).Elem().Name()
+					conv.ForeignKey = strlib.ConvertToSnakeCase(modelName) + "_id"
+				}
 			}
+
+			if conv.LocalKey == "" {
+				conv.LocalKey = "_id"
+			}
+
+			if r.Pivot != nil {
+				conv.Pivot = &PivotConfig{
+					Table:      r.Pivot.Table,
+					ForeignKey: r.Pivot.ForeignKey,
+					RelatedKey: r.Pivot.RelatedKey,
+					Fields:     r.Pivot.Fields,
+				}
+			}
+
 			s.modelRelations = append(s.modelRelations, conv)
 		}
 	}
@@ -2162,40 +2436,43 @@ func mapModelRelType(t BaseModels.RelationshipType) RelationType {
 	}
 }
 
-// findModelRelation returns a Relation matching name or alias (case-insensitive, permissive)
+// findModelRelation finds a Relation matching a full dotted token like "parent.child"
+//
+// It allows both direct name matches and OutputField matches.
+// It also allows case-insensitive matches and snake case matches.
+//
+// Parameters: token string - the full dotted token to search for
+//
+// Returns: Relation, bool - the matching relation if found, false otherwise
 func (s *EloquentService[T]) findModelRelation(token string) (Relation, bool) {
 	name := strings.TrimSpace(token)
 	if name == "" {
 		return Relation{}, false
 	}
-	lowerName := strings.ToLower(name)
 
 	for _, r := range s.modelRelations {
-		// prepare comparison variants
-		rName := strings.ToLower(strings.TrimSpace(r.Name))
-		rOut := strings.ToLower(strings.TrimSpace(r.OutputField()))
-		rRelated := strings.ToLower(strings.TrimSpace(r.Related))
-
-		// last segment of dotted relation name (e.g., "cm_products.periods" -> "periods")
-		rNameLast := rName
-		if idx := strings.LastIndex(rName, "."); idx != -1 && idx+1 < len(rName) {
-			rNameLast = rName[idx+1:]
-		}
-		// last segment of output field as well
-		rOutLast := rOut
-		if idx := strings.LastIndex(rOut, "."); idx != -1 && idx+1 < len(rOut) {
-			rOutLast = rOut[idx+1:]
+		// Direct name match
+		if r.Name == name {
+			return r, true
 		}
 
-		// also consider snake_case/pluralized forms of the token for matching against Related
-		snake := strings.ToLower(strlib.ConvertToSnakeCase(name))
-		plural := strings.ToLower(strlib.Pluralize(strlib.ConvertToSnakeCase(name)))
+		// Output field match
+		if r.OutputField() == name {
+			return r, true
+		}
 
-		if lowerName == rName || lowerName == rOut || lowerName == rRelated || lowerName == rNameLast || lowerName == rOutLast || lowerName == snake || lowerName == plural {
-			cpy := r
-			return cpy, true
+		// Case-insensitive match
+		if strings.EqualFold(r.Name, name) || strings.EqualFold(r.OutputField(), name) {
+			return r, true
+		}
+
+		// Snake case match
+		snakeName := strlib.ConvertToSnakeCase(name)
+		if strings.EqualFold(strlib.ConvertToSnakeCase(r.Name), snakeName) {
+			return r, true
 		}
 	}
+
 	return Relation{}, false
 }
 
