@@ -981,7 +981,12 @@ func (e *Eloquent[T]) getWithRelations() ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(e.service.Ctx)
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+
+		}
+	}(cursor, e.service.Ctx)
 
 	var results []T
 	var docsForCache []bson.M
@@ -1866,7 +1871,7 @@ func (s *EloquentService[T]) CreateOrUpdate(model T) (T, error) {
 	delete(doc, "_id")
 
 	// Preserve original timestamps
-	if err == nil { // Document exists
+	{ // Document exists
 		doc["created_at"] = existing.GetCreatedAt()
 		if existing.GetDeletedAt() != (time.Time{}) {
 			doc["deleted_at"] = existing.GetDeletedAt()
